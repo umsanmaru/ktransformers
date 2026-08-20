@@ -227,19 +227,29 @@ class AMX_MOE_BASE {
   //          쓴다 (gate/up은 열 분할이라 노드 간 합산 없음). overwrite
   //          의미론 — skip된 expert slot은 미기록(undefined).
   //
-  // K1 범위: decode(qlen==1)만. qlen>1은 prefill식 토큰 그룹핑과 함께 후속.
+  // decode(qlen==1)는 x에서 직접 pack하는 빠른 경로, qlen>1은 kt
+  // forward_prefill과 동형의 토큰 그룹핑(gather가 밴드 슬라이싱을 흡수 —
+  // strided pack 불필요) 경로를 탄다. stage/export는 두 경로가 공유한다
+  // (decode는 m_local_pos_ == 0의 퇴화형).
   void forward_gateup_partial(int qlen, int k, const int64_t* expert_ids, const void* input, void* out) {
-    if (qlen != 1) {
-      throw std::runtime_error("forward_gateup_partial: only qlen==1 (decode) is supported");
+    if (qlen == 1) {
+      // full-width 입력에서 자기 밴드의 시작 — 단일 행이라 row stride 무관
+      const ggml_bf16_t* x_band = (const ggml_bf16_t*)input + config_.partial.gateup.offset;
+      int activated_expert = prepare_gateup_routing(k, expert_ids);
+      if (activated_expert == 0) {
+        return;
+      }
+      carve_and_pack_gateup(activated_expert, qlen, x_band);
+      run_gateup_stage(activated_expert, qlen);
+      export_gateup_partial(qlen, k, expert_ids, (ggml_bf16_t*)out);
+      return;
     }
-    // full-width 입력에서 자기 밴드의 시작 — qlen==1이라 row stride 무관
-    const ggml_bf16_t* x_band = (const ggml_bf16_t*)input + config_.partial.gateup.offset;
-
-    int activated_expert = prepare_gateup_routing(k, expert_ids);
+    int activated_expert = prepare_prefill_routing(qlen, k, expert_ids);
     if (activated_expert == 0) {
       return;
     }
-    carve_and_pack_gateup(activated_expert, qlen, x_band);
+    carve_gateup_prefill();
+    gather_and_pack_gateup_prefill(qlen, k, expert_ids, (const ggml_bf16_t*)input, activated_expert);
     run_gateup_stage(activated_expert, qlen);
     export_gateup_partial(qlen, k, expert_ids, (ggml_bf16_t*)out);
   }
@@ -254,6 +264,7 @@ class AMX_MOE_BASE {
       if (config_.should_skip_expert(expert_ids[i])) {
         continue;
       }
+      m_local_pos_[0][i] = 0;  // export가 pos 기반이라 decode도 채운다 (퇴화값)
       m_expert_id_map_[activated_expert] = expert_ids[i];
       m_local_num_[expert_ids[i]] = 1;
       activated_expert++;
@@ -313,12 +324,111 @@ class AMX_MOE_BASE {
           int ith = task_id % nth;
           derived()->do_gate_up_gemm(do_up, expert_idx, ith, nth, qlen);
           if (do_up) {
-            up_bc_[expert_idx]->to_mat(qlen, m_local_up_output_ptr_[expert_idx], ith, nth);
+            up_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_up_output_ptr_[expert_idx], ith, nth);
           } else {
-            gate_bc_[expert_idx]->to_mat(qlen, m_local_gate_output_ptr_[expert_idx], ith, nth);
+            gate_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_gate_output_ptr_[expert_idx], ith, nth);
           }
         },
         nullptr);
+  }
+
+  // ── prefill(qlen>1) 전용: kt forward_prefill의 1~3단계 동형 ─────────────
+  // 라우팅: 토큰을 expert 그룹으로 배치 (m_local_pos_[m][j] = 그룹 내 행).
+  int prepare_prefill_routing(int qlen, int k, const int64_t* expert_ids) {
+    int activated_expert = 0;
+    std::fill(m_local_num_.begin(), m_local_num_.end(), 0);
+    for (int i = 0; i < qlen; i++) {
+      for (int j = 0; j < k; j++) {
+        if (config_.should_skip_expert(expert_ids[i * k + j])) {
+          continue;
+        }
+        m_local_pos_[i][j] = m_local_num_[expert_ids[i * k + j]]++;
+      }
+    }
+    for (int i = 0; i < config_.expert_num; i++) {
+      if (m_local_num_[i] > 0) {
+        m_expert_id_map_[activated_expert] = i;
+        activated_expert++;
+      }
+    }
+    return activated_expert;
+  }
+
+  // carve (prefill, gateup 부분집합): 전 expert의 m_local ptr을 그룹 크기
+  // 누적으로 배정하고, 활성 expert에만 버퍼 구간을 준다. m_local_input의
+  // 행 폭은 gateup_k() — gather가 밴드만 담기 때문.
+  void carve_gateup_prefill() {
+    constexpr size_t M_STEP = T::M_STEP;
+    auto align64 = [](size_t v) { return (v + 63) & (~(size_t)63); };
+    void* gate_up_ba_pool_ptr = gate_up_ba_pool_;
+    void* gate_bc_pool_ptr = gate_bc_pool_;
+    void* up_bc_pool_ptr = up_bc_pool_;
+    size_t offset = 0;
+    size_t used_pool_m = 0, used_pool_bytes_a = 0, used_pool_bytes_bc_gate = 0, used_pool_bytes_bc_up = 0;
+    for (int i = 0; i < config_.expert_num; i++) {
+      m_local_input_ptr_[i] = m_local_input_ + offset * config_.gateup_k();
+      m_local_gate_output_ptr_[i] = m_local_gate_output_ + offset * config_.intermediate_size;
+      m_local_up_output_ptr_[i] = m_local_up_output_ + offset * config_.intermediate_size;
+      offset += m_local_num_[i];
+      if (m_local_num_[i] == 0) {
+        continue;
+      }
+      size_t max_m = (m_local_num_[i] + M_STEP - 1) / M_STEP * M_STEP;
+      gate_up_ba_[i]->max_m = max_m;
+      gate_up_ba_[i]->set_data(gate_up_ba_pool_ptr);
+      size_t ba_size = align64(buffer_a_required_size(max_m, config_.gateup_k()));
+      gate_up_ba_pool_ptr = (void*)((uintptr_t)gate_up_ba_pool_ptr + ba_size);
+
+      gate_bc_[i]->max_m = max_m;
+      gate_bc_[i]->set_data(gate_bc_pool_ptr);
+      size_t bc_gate_size = align64(buffer_c_required_size(max_m, config_.intermediate_size));
+      gate_bc_pool_ptr = (void*)((uintptr_t)gate_bc_pool_ptr + bc_gate_size);
+
+      up_bc_[i]->max_m = max_m;
+      up_bc_[i]->set_data(up_bc_pool_ptr);
+      size_t bc_up_size = align64(buffer_c_required_size(max_m, config_.intermediate_size));
+      up_bc_pool_ptr = (void*)((uintptr_t)up_bc_pool_ptr + bc_up_size);
+
+      used_pool_m += max_m;
+      used_pool_bytes_a += ba_size;
+      used_pool_bytes_bc_gate += bc_gate_size;
+      used_pool_bytes_bc_up += bc_up_size;
+    }
+    assert(used_pool_m <= pool_count_);
+    assert(used_pool_bytes_a <= gate_up_ba_pool_bytes_);
+    assert(used_pool_bytes_bc_gate <= gate_bc_pool_bytes_);
+    assert(used_pool_bytes_bc_up <= up_bc_pool_bytes_);
+  }
+
+  // gather + pack (prefill): gather의 memcpy가 full-width x에서 밴드만 담아
+  // strided pack을 불필요하게 만든다 — from_mat은 연속 [m_e, gateup_k]를 읽음.
+  void gather_and_pack_gateup_prefill(int qlen, int k, const int64_t* expert_ids, const ggml_bf16_t* x,
+                                      int activated_expert) {
+    auto pool = config_.pool->get_subpool(tp_part_idx);
+    auto direct_or_pool = [&](int count, auto&& fn) {
+      if (qlen < 10) {
+        for (int i = 0; i < count; i++) {
+          fn(i);
+        }
+      } else {
+        pool->do_work_stealing_job(count, nullptr, fn, nullptr);
+      }
+    };
+    const size_t band = (size_t)config_.gateup_k();
+    const size_t band_off = (size_t)config_.partial.gateup.offset;
+    direct_or_pool(qlen, [&](int i) {
+      for (int j = 0; j < k; j++) {
+        if (config_.should_skip_expert(expert_ids[i * k + j])) {
+          continue;
+        }
+        std::memcpy(m_local_input_ptr_[expert_ids[i * k + j]] + (size_t)m_local_pos_[i][j] * band,
+                    x + (size_t)i * config_.hidden_size + band_off, band * sizeof(ggml_bf16_t));
+      }
+    });
+    direct_or_pool(activated_expert, [this](int task_id) {
+      int expert_idx = m_expert_id_map_[task_id];
+      gate_up_ba_[expert_idx]->from_mat(m_local_num_[expert_idx], m_local_input_ptr_[expert_idx], 0, 1);
+    });
   }
 
   // export: 내부 expert-뭉치 배치(m_local_*)를 계약 slot 배치로 복사.
@@ -339,8 +449,9 @@ class AMX_MOE_BASE {
           continue;
         }
         ggml_bf16_t* dst = out + ((size_t)m * k + j) * row_elems;
-        std::memcpy(dst + n_off, m_local_gate_output_ptr_[e] + (size_t)m * inter, inter * sizeof(ggml_bf16_t));
-        std::memcpy(dst + n_total + n_off, m_local_up_output_ptr_[e] + (size_t)m * inter,
+        const size_t pos = (size_t)m_local_pos_[m][j];  // expert 그룹 내 이 토큰의 행
+        std::memcpy(dst + n_off, m_local_gate_output_ptr_[e] + pos * inter, inter * sizeof(ggml_bf16_t));
+        std::memcpy(dst + n_total + n_off, m_local_up_output_ptr_[e] + pos * inter,
                     inter * sizeof(ggml_bf16_t));
       }
     }
@@ -358,14 +469,22 @@ class AMX_MOE_BASE {
   //        이 노드는 자기 shard 열 [down_n.offset, +down_n.rows)만 쓴다.
   //        overwrite 의미론 — skip slot 미기록(undefined).
   void forward_down_partial(int qlen, int k, const int64_t* expert_ids, const void* act, void* out) {
-    if (qlen != 1) {
-      throw std::runtime_error("forward_down_partial: only qlen==1 (decode) is supported");
+    if (qlen == 1) {
+      int activated_expert = prepare_down_routing(k, expert_ids);
+      if (activated_expert == 0) {
+        return;
+      }
+      carve_and_pack_down(k, expert_ids, qlen, (const ggml_bf16_t*)act);
+      run_down_stage(activated_expert, qlen);
+      export_down_partial(qlen, k, expert_ids, (ggml_bf16_t*)out);
+      return;
     }
-    int activated_expert = prepare_down_routing(k, expert_ids);
+    int activated_expert = prepare_prefill_routing(qlen, k, expert_ids);
     if (activated_expert == 0) {
       return;
     }
-    carve_and_pack_down(k, expert_ids, qlen, (const ggml_bf16_t*)act);
+    carve_down_prefill();
+    gather_and_pack_down_prefill(qlen, k, expert_ids, (const ggml_bf16_t*)act, activated_expert);
     run_down_stage(activated_expert, qlen);
     export_down_partial(qlen, k, expert_ids, (ggml_bf16_t*)out);
   }
@@ -379,6 +498,7 @@ class AMX_MOE_BASE {
       if (config_.should_skip_expert(expert_ids[i])) {
         continue;
       }
+      m_local_pos_[0][i] = 0;  // export가 pos 기반 (decode 퇴화값)
       m_expert_id_map_[activated_expert] = expert_ids[i];
       m_local_num_[expert_ids[i]] = 1;
       activated_expert++;
@@ -432,9 +552,78 @@ class AMX_MOE_BASE {
           int expert_idx = m_expert_id_map_[task_id / nth];
           int ith = task_id % nth;
           derived()->do_down_gemm(expert_idx, ith, nth, qlen);
-          down_bc_[expert_idx]->to_mat(qlen, m_local_down_output_ptr_[expert_idx], ith, nth);
+          down_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_down_output_ptr_[expert_idx], ith, nth);
         },
         nullptr);
+  }
+
+  // carve (prefill, down 부분집합): m_local_input(act gather용, 행 폭 down_k)과
+  // m_local_down(행 폭 down_n) ptr 배정 + down_ba/down_bc 구간.
+  void carve_down_prefill() {
+    constexpr size_t M_STEP = T::M_STEP;
+    auto align64 = [](size_t v) { return (v + 63) & (~(size_t)63); };
+    void* down_ba_pool_ptr = down_ba_pool_;
+    void* down_bc_pool_ptr = down_bc_pool_;
+    size_t offset = 0;
+    size_t used_pool_m = 0, used_pool_bytes_ba_down = 0, used_pool_bytes_bc_down = 0;
+    for (int i = 0; i < config_.expert_num; i++) {
+      m_local_input_ptr_[i] = m_local_input_ + offset * config_.down_k();
+      m_local_down_output_ptr_[i] = m_local_down_output_ + offset * config_.down_n();
+      offset += m_local_num_[i];
+      if (m_local_num_[i] == 0) {
+        continue;
+      }
+      size_t max_m = (m_local_num_[i] + M_STEP - 1) / M_STEP * M_STEP;
+      down_ba_[i]->max_m = max_m;
+      down_ba_[i]->set_data(down_ba_pool_ptr);
+      size_t ba_size = align64(buffer_a_required_size(max_m, config_.down_k()));
+      down_ba_pool_ptr = (void*)((uintptr_t)down_ba_pool_ptr + ba_size);
+
+      down_bc_[i]->max_m = max_m;
+      down_bc_[i]->set_data(down_bc_pool_ptr);
+      size_t bc_size = align64(buffer_c_required_size(max_m, config_.down_n()));
+      down_bc_pool_ptr = (void*)((uintptr_t)down_bc_pool_ptr + bc_size);
+
+      used_pool_m += max_m;
+      used_pool_bytes_ba_down += ba_size;
+      used_pool_bytes_bc_down += bc_size;
+    }
+    assert(used_pool_m <= pool_count_);
+    assert(used_pool_bytes_ba_down <= down_ba_pool_bytes_);
+    assert(used_pool_bytes_bc_down <= down_bc_pool_bytes_);
+  }
+
+  // gather + pack (prefill, down): act의 (m, slot) 행에서 down K 밴드만
+  // expert 그룹으로 모은다 — m_local_input을 act gather 버퍼로 재사용
+  // (gateup gather와 down gather는 시간상 서로 다른 phase라 충돌 없음).
+  void gather_and_pack_down_prefill(int qlen, int k, const int64_t* expert_ids, const ggml_bf16_t* act,
+                                    int activated_expert) {
+    auto pool = config_.pool->get_subpool(tp_part_idx);
+    auto direct_or_pool = [&](int count, auto&& fn) {
+      if (qlen < 10) {
+        for (int i = 0; i < count; i++) {
+          fn(i);
+        }
+      } else {
+        pool->do_work_stealing_job(count, nullptr, fn, nullptr);
+      }
+    };
+    const size_t band = (size_t)config_.down_k();
+    const size_t band_off = (size_t)config_.partial.down.offset;
+    const size_t act_row = (size_t)config_.n_total();
+    direct_or_pool(qlen, [&](int i) {
+      for (int j = 0; j < k; j++) {
+        if (config_.should_skip_expert(expert_ids[i * k + j])) {
+          continue;
+        }
+        std::memcpy(m_local_input_ptr_[expert_ids[i * k + j]] + (size_t)m_local_pos_[i][j] * band,
+                    act + ((size_t)i * k + j) * act_row + band_off, band * sizeof(ggml_bf16_t));
+      }
+    });
+    direct_or_pool(activated_expert, [this](int task_id) {
+      int expert_idx = m_expert_id_map_[task_id];
+      down_ba_[expert_idx]->from_mat(m_local_num_[expert_idx], m_local_input_ptr_[expert_idx], 0, 1);
+    });
   }
 
   // export: 자기 hidden shard 열 [down_n.offset, +down_n.rows)에 직접 쓰기.
@@ -452,7 +641,8 @@ class AMX_MOE_BASE {
           continue;
         }
         ggml_bf16_t* dst = out + ((size_t)m * k + j) * h_total;
-        std::memcpy(dst + n_off, m_local_down_output_ptr_[e] + (size_t)m * rows, rows * sizeof(ggml_bf16_t));
+        const size_t pos = (size_t)m_local_pos_[m][j];
+        std::memcpy(dst + n_off, m_local_down_output_ptr_[e] + pos * rows, rows * sizeof(ggml_bf16_t));
       }
     }
   }

@@ -306,8 +306,8 @@ class TP_MOE_Common : public MoE_Interface {
     int qlen = *qlen_ptr;
     // 검증은 반드시 호출 스레드에서 — worker(do_numa_job) 안의 throw는
     // uncaught → std::terminate. (node 쪽 guard들은 비-TP 직접 호출용.)
-    if (qlen != 1) [[unlikely]] {
-      throw std::runtime_error("forward_gateup_partial: only qlen==1 (decode) is supported (K1)");
+    if (qlen < 1 || qlen > config.max_len) [[unlikely]] {
+      throw std::runtime_error("forward_gateup_partial: qlen out of range [1, max_len]");
     }
     if (config.n_total() != config.intermediate_size) [[unlikely]] {
       // 상위 config의 n_total은 full inter와 같아야 노드 shard 열 쓰기가 안전
@@ -332,8 +332,8 @@ class TP_MOE_Common : public MoE_Interface {
       throw std::runtime_error("Not Loaded");
     }
     int qlen = *qlen_ptr;
-    if (qlen != 1) [[unlikely]] {
-      throw std::runtime_error("forward_down_partial: only qlen==1 (decode) is supported (K2)");
+    if (qlen < 1 || qlen > config.max_len) [[unlikely]] {
+      throw std::runtime_error("forward_down_partial: qlen out of range [1, max_len]");
     }
     auto pool = config.pool;
     pool->dispense_backend()->do_numa_job([this, qlen, k, expert_ids, act, out](int numa_id) {
