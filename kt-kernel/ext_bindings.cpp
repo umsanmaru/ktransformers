@@ -249,6 +249,56 @@ class MOEBindings {
       return cpuinfer_interface(moe, qlen, k, expert_ids, weights, input, output, false);
     }
   };
+
+  // ── Prism partial task 바인딩 (계약 ②) — ForwardBindings와 동형 ─────────
+  // cpuinfer_interface는 실행하지 않고 (fn, args) 쌍만 반환한다. Args는
+  // new로 영구 할당 — cudaLaunchHostFunc/graph에 굳는 주소이므로 (계약 ④
+  // 전제 ①: 가변값 qlen은 포인터(intptr) 경유, pinned 주소들은 불변).
+  class GateupPartialBindings {
+   public:
+    struct Args {
+      CPUInfer* cpuinfer;
+      TP_MOE<T>* moe;
+      intptr_t qlen;
+      int k;
+      intptr_t expert_ids;
+      intptr_t input;
+      intptr_t out;
+    };
+    static void inner(void* args) {
+      Args* args_ = (Args*)args;
+      args_->cpuinfer->enqueue(&TP_MOE<T>::forward_gateup_partial_binding, args_->moe, args_->qlen, args_->k,
+                               args_->expert_ids, args_->input, args_->out);
+    }
+    static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE<T>> moe, intptr_t qlen, int k,
+                                                            intptr_t expert_ids, intptr_t input, intptr_t out) {
+      Args* args = new Args{nullptr, moe.get(), qlen, k, expert_ids, input, out};
+      return std::make_pair((intptr_t)&inner, (intptr_t)args);
+    }
+  };
+
+  class DownPartialBindings {
+   public:
+    struct Args {
+      CPUInfer* cpuinfer;
+      TP_MOE<T>* moe;
+      intptr_t qlen;
+      int k;
+      intptr_t expert_ids;
+      intptr_t act;
+      intptr_t out;
+    };
+    static void inner(void* args) {
+      Args* args_ = (Args*)args;
+      args_->cpuinfer->enqueue(&TP_MOE<T>::forward_down_partial_binding, args_->moe, args_->qlen, args_->k,
+                               args_->expert_ids, args_->act, args_->out);
+    }
+    static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE<T>> moe, intptr_t qlen, int k,
+                                                            intptr_t expert_ids, intptr_t act, intptr_t out) {
+      Args* args = new Args{nullptr, moe.get(), qlen, k, expert_ids, act, out};
+      return std::make_pair((intptr_t)&inner, (intptr_t)args);
+    }
+  };
 };
 
 #if defined(__x86_64__) && defined(USE_AMX_AVX_KERNEL)
@@ -474,8 +524,12 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
   // 소비하도록 갱신된 백엔드만 opt-in 한다 (현재 BF16). 갱신 안 된 dtype에
   // 노출하면 full-K GEMM이 밴드 크기 BufferA를 읽어 조용히 틀린 값이 난다.
   if constexpr (WithPartial) {
+    // 동기 경로 (테스트/eager 직접 호출)
     moe_cls.def("forward_gateup_partial", &MoeClass::forward_gateup_partial_binding);
     moe_cls.def("forward_down_partial", &MoeClass::forward_down_partial_binding);
+    // task 경로 (CPUInfer.submit[_with_cuda_stream] 용 (fn, args) 쌍)
+    moe_cls.def("forward_gateup_partial_task", &MoeBindings::GateupPartialBindings::cpuinfer_interface);
+    moe_cls.def("forward_down_partial_task", &MoeBindings::DownPartialBindings::cpuinfer_interface);
   }
 
   // Bind write_weight_scale_to_buffer_task for MoE types that support it

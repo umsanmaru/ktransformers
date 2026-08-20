@@ -265,6 +265,58 @@ def test_unequal_numa_shard_tables(qlen):
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize("qlen", QLENS)
+def test_task_path_via_wrapper(qlen):
+    """K3: task 경로 (submit → TaskQueue worker 실행 → sync) + PartialMoEWrapper.
+    동기 경로와 같은 입력에서 같은 결과여야 한다."""
+    from kt_kernel.experts_partial import PartialMoEWrapper
+
+    torch.manual_seed(8)
+    gate_cold, up_cold, down_cold = make_weights(randn_gen)
+    cpuinfer = kt_kernel_ext.CPUInfer(CPUINFER_PARAM)
+
+    config = kt_kernel_ext.moe.MOEConfig(
+        expert_num, num_experts_per_tok, hidden_size, intermediate_size, 0
+    )
+    config.max_len = max_len
+    config.partial.enabled = True
+    config.partial.gateup.offset = GATEUP_K_OFFSET
+    config.partial.gateup.rows = GATEUP_K_ROWS
+    config.partial.down.offset = DOWN_K_OFFSET
+    config.partial.down.rows = DOWN_K_ROWS
+    config.partial.n_total = intermediate_size
+    config.pool = cpuinfer.backend_
+
+    wrapper = PartialMoEWrapper(config, cpuinfer)
+    wrapper.load_weights_from_tensors(gate_cold, up_cold, down_cold)
+
+    expert_ids = make_routing(qlen)
+    x = randn_gen((qlen, hidden_size)).contiguous()
+    qlen_t = torch.tensor([qlen], dtype=torch.int32)
+    out = torch.full((qlen, num_experts_per_tok, 2 * intermediate_size), 777.0, dtype=torch.bfloat16).contiguous()
+
+    wrapper.submit_forward_gateup(
+        qlen_t.data_ptr(), num_experts_per_tok, expert_ids.data_ptr(), x.data_ptr(), out.data_ptr()
+    )
+    wrapper.sync()
+    ref = gateup_reference(x, expert_ids, gate_cold, up_cold)
+    assert rel_diff(out, ref) < 0.02
+
+    act = randn_gen((qlen, num_experts_per_tok, intermediate_size)).contiguous()
+    out_d = torch.full((qlen, num_experts_per_tok, hidden_size), 777.0, dtype=torch.bfloat16).contiguous()
+    wrapper.submit_forward_down(
+        qlen_t.data_ptr(), num_experts_per_tok, expert_ids.data_ptr(), act.data_ptr(), out_d.data_ptr()
+    )
+    wrapper.sync()
+    assert rel_diff(out_d, down_reference(act, expert_ids, down_cold)) < 0.02
+
+    # 동기 편의 API도 같은 결과
+    out2 = torch.empty_like(out)
+    wrapper.forward_gateup(expert_ids, x, out2)
+    assert torch.equal(out, out2)
+
+
+@pytest.mark.cpu
 def test_fused_forward_rejected_on_partial_instance():
     """partial 인스턴스에 fused forward를 부르면 즉사 (조용한 오답 방지)."""
     torch.manual_seed(2)
