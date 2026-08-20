@@ -227,6 +227,23 @@ struct QuantConfig {
   bool per_channel = false;  // Per-channel quantization (GLM-4.7-FP8 style)
 };
 
+// ── Prism partial geometry types (계약: sglang prism CONTRACTS.md ②) ────
+// 함께 다니는 값들을 구조로 묶는다 — GeneralMOEConfig의 평평한 필드 사이에
+// 섞이지 않도록 config.partial.* 네임스페이스를 형성.
+
+// contraction 축의 연속 밴드 [offset, offset + rows)
+struct KRange {
+  int offset = 0;
+  int rows = 0;
+};
+
+struct PartialGeometry {
+  bool enabled = false;
+  KRange gateup;  // gate/up 공유 (2026-08-20 확정: 두 행렬은 K·N 분할을 공유) — hidden 축
+  KRange down;    // intermediate 축, global 좌표. full이면 {0, intermediate_size} 명시
+  int n_total = 0;  // gate/up 출력축(intermediate)의 full 크기
+};
+
 struct GeneralMOEConfig {
   // Basic Config
   int expert_num;
@@ -323,6 +340,24 @@ struct GeneralMOEConfig {
   // When alpha > 0, act_fn uses the swigluoai formula with symmetric clamp on
   // both gate and up (±swiglu_limit). 0.0f = disabled (standard silu path).
   float swiglu_alpha = 0.0f;
+
+  // ── Prism partial (K-split tier) geometry ─────────────────────────────
+  // 계약: sglang prism CONTRACTS.md ②. partial.enabled == false(기본)이면
+  // 기존 full-K 동작과 완전히 동일하다. K-축 밴드 기하는 로드 시점에
+  // 인스턴스에 구워지며(호출 인자에 없음), 입력 activation은 항상
+  // full-width로 받아 인스턴스가 자기 offset에서 읽는다.
+  // enabled == true이면 모든 range와 n_total은 명시값이어야 한다
+  // ("0 = full" 센티널 없음 — down이 full이면 {0, intermediate_size}로 적음).
+  PartialGeometry partial;
+
+  inline bool is_partial() const { return partial.enabled; }
+  // gate/up의 contraction 축(hidden) 밴드 크기
+  inline int gateup_k() const { return partial.enabled ? partial.gateup.rows : hidden_size; }
+  // down의 contraction 축(intermediate, global 좌표) 밴드 크기
+  inline int down_k() const { return partial.enabled ? partial.down.rows : intermediate_size; }
+  // gate/up 출력축(intermediate)의 full 크기 — TP 분할 후 노드 config의
+  // intermediate_size는 shard가 되므로 full-width out 열 쓰기에 필요
+  inline int n_total() const { return partial.enabled ? partial.n_total : intermediate_size; }
 
   GeneralMOEConfig() {}
 

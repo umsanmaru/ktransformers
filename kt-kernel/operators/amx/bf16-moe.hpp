@@ -100,10 +100,11 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
     auto& bc = do_up ? up_bc_[expert_idx] : gate_bc_[expert_idx];
 
     // Use vec_mul/mat_mul (no group_size)
+    // K 치수는 접근자 경유 — partial 인스턴스면 밴드 크기, 아니면 full (동일)
     if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
-      amx::mat_mul(m, config_.intermediate_size, config_.hidden_size, ba, bb, bc, ith, nth);
+      amx::mat_mul(m, config_.intermediate_size, config_.gateup_k(), ba, bb, bc, ith, nth);
     } else {
-      amx::vec_mul(m, config_.intermediate_size, config_.hidden_size, ba, bb, bc, ith, nth);
+      amx::vec_mul(m, config_.intermediate_size, config_.gateup_k(), ba, bb, bc, ith, nth);
     }
   }
 
@@ -111,10 +112,10 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
     int m = m_local_num_[expert_idx];
 
     if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
-      amx::mat_mul(m, config_.hidden_size, config_.intermediate_size, down_ba_[expert_idx], down_bb_[expert_idx],
+      amx::mat_mul(m, config_.hidden_size, config_.down_k(), down_ba_[expert_idx], down_bb_[expert_idx],
                    down_bc_[expert_idx], ith, nth);
     } else {
-      amx::vec_mul(m, config_.hidden_size, config_.intermediate_size, down_ba_[expert_idx], down_bb_[expert_idx],
+      amx::vec_mul(m, config_.hidden_size, config_.down_k(), down_ba_[expert_idx], down_bb_[expert_idx],
                    down_bc_[expert_idx], ith, nth);
     }
   }
@@ -180,13 +181,14 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
           int ith = task_id % nth;
 
           // Gate: from BF16 data (no scale)
+          // expert stride = 노드 스테이징 [I_node, gateup_k] — K 치수는 접근자
           gate_bb_[expert_idx]->from_mat(
-              (ggml_bf16_t*)config_.gate_proj + (logical_expert_id * config_.intermediate_size * config_.hidden_size),
+              (ggml_bf16_t*)config_.gate_proj + (logical_expert_id * config_.intermediate_size * config_.gateup_k()),
               ith, nth);  // 3 parameters: (bf16*, ith, nth)
 
           // Up: same
           up_bb_[expert_idx]->from_mat(
-              (ggml_bf16_t*)config_.up_proj + (logical_expert_id * config_.intermediate_size * config_.hidden_size),
+              (ggml_bf16_t*)config_.up_proj + (logical_expert_id * config_.intermediate_size * config_.gateup_k()),
               ith, nth);
         },
         nullptr);
@@ -200,9 +202,9 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
           uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
           int ith = task_id % nth;
 
-          // Down
+          // Down — expert stride = 노드 스테이징 [H, down_k]
           down_bb_[expert_idx]->from_mat(
-              (ggml_bf16_t*)config_.down_proj + (logical_expert_id * config_.intermediate_size * config_.hidden_size),
+              (ggml_bf16_t*)config_.down_proj + (logical_expert_id * config_.down_k() * config_.hidden_size),
               ith, nth);
         },
         nullptr);
@@ -453,19 +455,28 @@ class TP_MOE<AMX_BF16_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_BF16_MOE_TP
     }
 
     const bool use_per_expert_ptrs = !config.gate_projs.empty();
-    const size_t full_weight_elems = (size_t)config.intermediate_size * config.hidden_size;
+    if (config.is_partial() && config.partial.down.rows != config.intermediate_size) {
+      // down 밴드가 full이 아닌 경우의 스테이징은 K2(down N-split)에서 구현.
+      throw std::runtime_error("BF16 TP load: down partial staging not implemented yet (K2)");
+    }
+    // Prism partial: gate/up과 down의 per-expert 원소 수가 달라질 수 있어
+    // (gate/up K = gateup_k(), down K = down_k()) 분리 계산한다.
+    // 기하 필드가 전부 0이면 기존 값과 동일하다.
+    const size_t full_gateup_elems = (size_t)config.intermediate_size * config.gateup_k();
+    const size_t full_down_elems = (size_t)config.down_k() * config.hidden_size;
 
     pool->dispense_backend()->do_numa_job([&, this](int i) {
       auto& tpc = tps[i]->config_;
-      const size_t tp_weight_elems = (size_t)tpc.intermediate_size * tpc.hidden_size;
+      const size_t tp_gateup_elems = (size_t)tpc.intermediate_size * tpc.gateup_k();
+      const size_t tp_down_elems = (size_t)tpc.down_k() * tpc.hidden_size;
 
       // Allocate BF16 weights (2 bytes/element)
-      tpc.gate_proj = new ggml_bf16_t[tpc.expert_num * tp_weight_elems];
-      tpc.up_proj = new ggml_bf16_t[tpc.expert_num * tp_weight_elems];
-      tpc.down_proj = new ggml_bf16_t[tpc.expert_num * tp_weight_elems];
+      tpc.gate_proj = new ggml_bf16_t[tpc.expert_num * tp_gateup_elems];
+      tpc.up_proj = new ggml_bf16_t[tpc.expert_num * tp_gateup_elems];
+      tpc.down_proj = new ggml_bf16_t[tpc.expert_num * tp_down_elems];
 
       const size_t tp_idx = (size_t)i;
-      const size_t gate_up_weight_src_offset = i * tp_weight_elems;
+      const size_t gate_up_weight_src_offset = i * tp_gateup_elems;
       const size_t down_weight_src_col_offset = i * (size_t)tpc.intermediate_size;
 
       pool->get_subpool(i)->do_work_stealing_job(
@@ -473,9 +484,9 @@ class TP_MOE<AMX_BF16_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_BF16_MOE_TP
           [&](int expert_id_) {
             const size_t expert_id = expert_map(physical_to_logical_map, expert_id_);
 
-            ggml_bf16_t* gate_dst = (ggml_bf16_t*)tpc.gate_proj + expert_id * tp_weight_elems;
-            ggml_bf16_t* up_dst = (ggml_bf16_t*)tpc.up_proj + expert_id * tp_weight_elems;
-            ggml_bf16_t* down_dst = (ggml_bf16_t*)tpc.down_proj + expert_id * tp_weight_elems;
+            ggml_bf16_t* gate_dst = (ggml_bf16_t*)tpc.gate_proj + expert_id * tp_gateup_elems;
+            ggml_bf16_t* up_dst = (ggml_bf16_t*)tpc.up_proj + expert_id * tp_gateup_elems;
+            ggml_bf16_t* down_dst = (ggml_bf16_t*)tpc.down_proj + expert_id * tp_down_elems;
 
             const ggml_bf16_t* gate_src;
             const ggml_bf16_t* up_src;
@@ -487,18 +498,18 @@ class TP_MOE<AMX_BF16_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_BF16_MOE_TP
               down_src = (const ggml_bf16_t*)config.down_projs[0][expert_id];
             } else {
               gate_src =
-                  (const ggml_bf16_t*)config.gate_proj + expert_id * full_weight_elems + gate_up_weight_src_offset;
-              up_src = (const ggml_bf16_t*)config.up_proj + expert_id * full_weight_elems + gate_up_weight_src_offset;
-              down_src = (const ggml_bf16_t*)config.down_proj + expert_id * full_weight_elems;
+                  (const ggml_bf16_t*)config.gate_proj + expert_id * full_gateup_elems + gate_up_weight_src_offset;
+              up_src = (const ggml_bf16_t*)config.up_proj + expert_id * full_gateup_elems + gate_up_weight_src_offset;
+              down_src = (const ggml_bf16_t*)config.down_proj + expert_id * full_down_elems;
             }
 
             // Copy gate and up weights
-            std::memcpy(gate_dst, gate_src, tp_weight_elems * sizeof(ggml_bf16_t));
-            std::memcpy(up_dst, up_src, tp_weight_elems * sizeof(ggml_bf16_t));
+            std::memcpy(gate_dst, gate_src, tp_gateup_elems * sizeof(ggml_bf16_t));
+            std::memcpy(up_dst, up_src, tp_gateup_elems * sizeof(ggml_bf16_t));
 
-            // Copy down weights (row-wise split)
+            // Copy down weights (row-wise split; src row stride = global down K)
             for (int row = 0; row < config.hidden_size; row++) {
-              const size_t src_row_offset = (size_t)row * (size_t)config.intermediate_size + down_weight_src_col_offset;
+              const size_t src_row_offset = (size_t)row * (size_t)config.down_k() + down_weight_src_col_offset;
               const size_t dst_row_offset = (size_t)row * (size_t)tpc.intermediate_size;
               std::memcpy(down_dst + dst_row_offset, down_src + src_row_offset,
                           (size_t)tpc.intermediate_size * sizeof(ggml_bf16_t));

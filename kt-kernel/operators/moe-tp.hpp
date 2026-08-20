@@ -203,6 +203,12 @@ class TP_MOE_Common : public MoE_Interface {
     if (weights_loaded == false) [[unlikely]] {
       throw std::runtime_error("Not Loaded");
     }
+    if (config.is_partial()) [[unlikely]] {
+      // 반드시 호출 스레드에서 거부해야 한다 — worker 스레드(do_numa_job)
+      // 안에서 던지면 uncaught → std::terminate (base::forward의 guard는
+      // 비-TP 직접 호출용 이중 방어로 유지).
+      throw std::runtime_error("TP_MOE::forward called on a Prism partial instance");
+    }
 #ifdef FORWARD_TIME_REPORT
     auto start = std::chrono::high_resolution_clock::now();
 #endif
@@ -243,6 +249,37 @@ class TP_MOE_Common : public MoE_Interface {
         forward_time, end.time_since_epoch().count() / 1000 % 100000000, band_width, average_bandwidth, GFLOPS,
         numa_node_of_cpu(sched_getcpu()));
 #endif
+  }
+
+  // ── Prism partial: gateup pre-act partial (계약 ②) ────────────────────
+  // forward 가족과 같은 2단 구성: 타입 있는 본체 + intptr 캐스팅 binding.
+  // gate/up은 inter 축 열 분할이므로 각 노드가 full-width out의 자기 shard
+  // 열 구간에 직접 쓴다 — merge 단계가 없다 (down partial은 K2에서 hidden
+  // 축 N-분할로 동형 구현 예정). routing weight 인자도 없다 (가중은 GPU
+  // rejoin). T가 forward_gateup_partial을 제공할 때만 인스턴스화되는
+  // 템플릿-지연 메서드다 (llamafile 등 미지원 백엔드는 바인딩하지 않음).
+  void forward_gateup_partial(int* qlen_ptr, int k, const int64_t* expert_ids, const void* input, void* out) {
+    if (weights_loaded == false) [[unlikely]] {
+      throw std::runtime_error("Not Loaded");
+    }
+    int qlen = *qlen_ptr;
+    // 검증은 반드시 호출 스레드에서 — worker(do_numa_job) 안의 throw는
+    // uncaught → std::terminate. (node 쪽 guard들은 비-TP 직접 호출용.)
+    if (qlen != 1) [[unlikely]] {
+      throw std::runtime_error("forward_gateup_partial: only qlen==1 (decode) is supported (K1)");
+    }
+    if (config.n_total() != config.intermediate_size) [[unlikely]] {
+      // 상위 config의 n_total은 full inter와 같아야 노드 shard 열 쓰기가 안전
+      throw std::runtime_error("forward_gateup_partial: partial.n_total != full intermediate_size");
+    }
+    auto pool = config.pool;
+    pool->dispense_backend()->do_numa_job([this, qlen, k, expert_ids, input, out](int numa_id) {
+      tps[numa_id]->forward_gateup_partial(qlen, k, expert_ids, input, out);
+    });
+  }
+
+  void forward_gateup_partial_binding(intptr_t qlen_ptr, int k, intptr_t expert_ids, intptr_t input, intptr_t out) {
+    forward_gateup_partial((int*)qlen_ptr, k, (const int64_t*)expert_ids, (const void*)input, (void*)out);
   }
 
   virtual void load_weights() = 0;

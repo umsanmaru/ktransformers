@@ -444,7 +444,7 @@ void bind_moe_sft_module(py::module_& moe_module, const char* name) {
 }
 #endif  // defined(__x86_64__) && defined(USE_AMX_AVX_KERNEL)
 
-template <typename MoeTP>
+template <typename MoeTP, bool WithPartial = false>
 void bind_moe_module(py::module_& moe_module, const char* name) {
   using MoeClass = TP_MOE<MoeTP>;
   using MoeBindings = MOEBindings<MoeTP>;
@@ -469,6 +469,13 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
       .def("warm_up", &MoeClass::warm_up)
       .def("load_weights", &MoeClass::load_weights)
       .def("forward", &MoeClass::forward_binding);
+
+  // Prism partial 진입점 — do_*_gemm이 partial K 치수(gateup_k/down_k)를
+  // 소비하도록 갱신된 백엔드만 opt-in 한다 (현재 BF16). 갱신 안 된 dtype에
+  // 노출하면 full-K GEMM이 밴드 크기 BufferA를 읽어 조용히 틀린 값이 난다.
+  if constexpr (WithPartial) {
+    moe_cls.def("forward_gateup_partial", &MoeClass::forward_gateup_partial_binding);
+  }
 
   // Bind write_weight_scale_to_buffer_task for MoE types that support it
   // Uses SFINAE to detect if MoeClass has write_weight_scale_to_buffer method
@@ -743,6 +750,18 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
 
   auto moe_module = m.def_submodule("moe");
 
+  // Prism partial geometry types (config.partial.* 네임스페이스)
+  py::class_<KRange>(moe_module, "KRange")
+      .def(py::init<>())
+      .def_readwrite("offset", &KRange::offset)
+      .def_readwrite("rows", &KRange::rows);
+  py::class_<PartialGeometry>(moe_module, "PartialGeometry")
+      .def(py::init<>())
+      .def_readwrite("enabled", &PartialGeometry::enabled)
+      .def_readwrite("gateup", &PartialGeometry::gateup)
+      .def_readwrite("down", &PartialGeometry::down)
+      .def_readwrite("n_total", &PartialGeometry::n_total);
+
   py::class_<GeneralMOEConfig>(moe_module, "MOEConfig")
       .def(py::init([](int expert_num, int routed_expert_num, int hidden_size, int intermediate_size) {
         return GeneralMOEConfig(expert_num, routed_expert_num, hidden_size, intermediate_size);
@@ -767,6 +786,10 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def_readwrite("intermediate_size", &GeneralMOEConfig::intermediate_size)
       .def_readwrite("layer_idx", &GeneralMOEConfig::layer_idx)
       .def_readwrite("pool", &GeneralMOEConfig::pool)
+
+      // Prism partial (K-split tier) geometry — 계약: sglang prism CONTRACTS.md ②
+      // (KRange/PartialGeometry 클래스 바인딩은 MOEConfig 바인딩 직전에 등록)
+      .def_readwrite("partial", &GeneralMOEConfig::partial)
 
       .def_readonly("num_gpu_experts", &GeneralMOEConfig::num_gpu_experts)
       .def_property(
@@ -863,7 +886,7 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   bind_moe_module<AMX_K2_MOE_TP<amx::GemmKernel224Int4SmallKGroup>>(moe_module, "AMXInt4_KGroup_MOE");
   bind_moe_module<AMX_K2_MOE_TP<amx::GemmKernel224Int4SmallKGroupBlocked>>(moe_module, "AMXInt4_KGroupBlocked_MOE");
 #if defined(__AVX512F__)
-  bind_moe_module<AMX_BF16_MOE_TP<amx::GemmKernel224BF16>>(moe_module, "AMXBF16_MOE");
+  bind_moe_module<AMX_BF16_MOE_TP<amx::GemmKernel224BF16>, /*WithPartial=*/true>(moe_module, "AMXBF16_MOE");
   bind_moe_module<AMX_FP8_MOE_TP<amx::GemmKernel224FP8>>(moe_module, "AMXFP8_MOE");
   bind_moe_module<AMX_FP8_PERCHANNEL_MOE_TP<amx::GemmKernel224FP8PerChannel>>(moe_module, "AMXFP8PerChannel_MOE");
   bind_moe_module<AMX_FP4_MOE_TP<amx::GemmKernel224MXFP4SmallKGroup>>(moe_module, "AMXFP4_KGroup_MOE");

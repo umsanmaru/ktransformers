@@ -124,32 +124,35 @@ class AMX_MOE_BASE {
     m_local_up_output_ptr_.resize(config_.expert_num);
     m_local_down_output_ptr_.resize(config_.expert_num);
 
+    // Prism partial: contraction(K) 축 치수는 접근자를 통해 읽는다 —
+    // 기하 필드가 0(기본)이면 full 치수를 돌려주므로 기존 동작과 동일.
+    // (gate/up의 K = gateup_k(), down의 K = down_k(); N 축은 불변)
     for (size_t i = 0; i < config_.expert_num; i++) {
-      gate_up_ba_.push_back(make_buffer_a(config_.max_len, config_.hidden_size, nullptr));
+      gate_up_ba_.push_back(make_buffer_a(config_.max_len, config_.gateup_k(), nullptr));
       gate_bc_.push_back(make_buffer_c(config_.max_len, config_.intermediate_size, nullptr));
       up_bc_.push_back(make_buffer_c(config_.max_len, config_.intermediate_size, nullptr));
-      down_ba_.push_back(make_buffer_a(config_.max_len, config_.intermediate_size, nullptr));
+      down_ba_.push_back(make_buffer_a(config_.max_len, config_.down_k(), nullptr));
       down_bc_.push_back(make_buffer_c(config_.max_len, config_.hidden_size, nullptr));
 
       void* gate_bb_ptr =
-          std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
-      gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, gate_bb_ptr));
+          std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.gateup_k()));
+      gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.gateup_k(), gate_bb_ptr));
 
-      void* up_bb_ptr = std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
-      up_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, up_bb_ptr));
+      void* up_bb_ptr = std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.gateup_k()));
+      up_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.gateup_k(), up_bb_ptr));
 
       void* down_bb_ptr =
-          std::aligned_alloc(64, buffer_b_required_size(config_.hidden_size, config_.intermediate_size));
-      down_bb_.push_back(make_buffer_b(config_.hidden_size, config_.intermediate_size, down_bb_ptr));
+          std::aligned_alloc(64, buffer_b_required_size(config_.hidden_size, config_.down_k()));
+      down_bb_.push_back(make_buffer_b(config_.hidden_size, config_.down_k(), down_bb_ptr));
     }
     // TODO: need update to all *.hpp
     // (config_.expert_num * T::M_STEP) in pool_count_ is to ensure padding for each experts.
     pool_count_ = (size_t)config_.max_len * config_.num_experts_per_tok + config_.expert_num * T::M_STEP;
 
-    gate_up_ba_pool_bytes_ = buffer_a_required_size(pool_count_, config_.hidden_size) + pool_count_ * 64;
+    gate_up_ba_pool_bytes_ = buffer_a_required_size(pool_count_, config_.gateup_k()) + pool_count_ * 64;
     gate_bc_pool_bytes_ = buffer_c_required_size(pool_count_, config_.intermediate_size) + pool_count_ * 64;
     up_bc_pool_bytes_ = buffer_c_required_size(pool_count_, config_.intermediate_size) + pool_count_ * 64;
-    down_ba_pool_bytes_ = buffer_a_required_size(pool_count_, config_.intermediate_size) + pool_count_ * 64;
+    down_ba_pool_bytes_ = buffer_a_required_size(pool_count_, config_.down_k()) + pool_count_ * 64;
     down_bc_pool_bytes_ = buffer_c_required_size(pool_count_, config_.hidden_size) + pool_count_ * 64;
 
     mem_requests.append_pointer(&gate_up_ba_pool_, gate_up_ba_pool_bytes_);
@@ -177,6 +180,11 @@ class AMX_MOE_BASE {
   }
 
   void forward(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input, void* output) {
+    if (config_.is_partial()) {
+      // partial 인스턴스는 fused forward를 지원하지 않는다 — 잘못 호출되면
+      // K-슬라이스 weight로 full expert를 계산해 조용히 틀린 값이 나온다.
+      throw std::runtime_error("AMX_MOE_BASE::forward called on a Prism partial instance");
+    }
     if (qlen > 1) {
       forward_prefill(qlen, k, expert_ids, weights, input, output);
     } else {
@@ -184,6 +192,139 @@ class AMX_MOE_BASE {
     }
   }
 
+  // ── Prism partial 진입점 (계약: sglang prism CONTRACTS.md ②) ──────────
+  // forward_decode의 1~4단계(라우팅 준비 → 풀 carving → x pack → gate/up
+  // GEMM)까지만 수행하고 pre-activation partial을 out에 export한다.
+  // act / down / router 가중 / expert 합산 없음 — 전부 GPU rejoin 소관.
+  //
+  //   input: bf16 [qlen × hidden_FULL] — full-width. 이 인스턴스는
+  //          [gateup_k_offset, +gateup_k_rows) 열만 읽는다 (기하는 로드
+  //          시점에 구워졌고 호출 인자에 없다).
+  //   out  : bf16 [qlen × k × 2·n_total], 열 [0,n_total)=gate,
+  //          [n_total,2·n_total)=up. TP 노드는 자기 inter shard 열 구간만
+  //          쓴다 (gate/up은 열 분할이라 노드 간 합산 없음). overwrite
+  //          의미론 — skip된 expert slot은 미기록(undefined).
+  //
+  // K1 범위: decode(qlen==1)만. qlen>1은 prefill식 토큰 그룹핑과 함께 후속.
+  void forward_gateup_partial(int qlen, int k, const int64_t* expert_ids, const void* input, void* out) {
+    if (qlen != 1) {
+      throw std::runtime_error("forward_gateup_partial: only qlen==1 (decode) is supported");
+    }
+    // full-width 입력에서 자기 밴드의 시작 — qlen==1이라 row stride 무관
+    const ggml_bf16_t* x_band = (const ggml_bf16_t*)input + config_.partial.gateup.offset;
+
+    int activated_expert = prepare_gateup_routing(k, expert_ids);
+    if (activated_expert == 0) {
+      return;
+    }
+    carve_and_pack_gateup(activated_expert, qlen, x_band);
+    run_gateup_stage(activated_expert, qlen);
+    export_gateup_partial(qlen, k, expert_ids, (ggml_bf16_t*)out);
+  }
+
+ private:
+  // 라우팅 준비: forward_decode 1단계와 동일한 멤버 상태(m_expert_id_map_,
+  // m_local_num_, m_local_{gate,up}_output_ptr_)를 만든다. 반환 = 활성 expert 수.
+  int prepare_gateup_routing(int k, const int64_t* expert_ids) {
+    int activated_expert = 0;
+    std::fill(m_local_num_.begin(), m_local_num_.end(), 0);
+    for (int i = 0; i < k; i++) {
+      if (config_.should_skip_expert(expert_ids[i])) {
+        continue;
+      }
+      m_expert_id_map_[activated_expert] = expert_ids[i];
+      m_local_num_[expert_ids[i]] = 1;
+      activated_expert++;
+    }
+    size_t offset = 0;
+    for (int i = 0; i < activated_expert; i++) {
+      auto expert_idx = m_expert_id_map_[i];
+      m_local_gate_output_ptr_[expert_idx] = m_local_gate_output_ + offset * config_.intermediate_size;
+      m_local_up_output_ptr_[expert_idx] = m_local_up_output_ + offset * config_.intermediate_size;
+      offset += 1;
+    }
+    return activated_expert;
+  }
+
+  // 풀 carving + x pack: 활성 expert에만 gate_bc/up_bc/gate_up_ba 구간을
+  // 배정하고 (forward_decode 2단계의 gateup 부분집합), 밴드 x를 pack한다.
+  void carve_and_pack_gateup(int activated_expert, int qlen, const ggml_bf16_t* x_band) {
+    constexpr size_t M_STEP = T::M_STEP;
+    auto align64 = [](size_t v) { return (v + 63) & (~(size_t)63); };
+    void* gate_bc_pool_ptr = gate_bc_pool_;
+    void* up_bc_pool_ptr = up_bc_pool_;
+    void* gate_up_ba_pool_ptr = gate_up_ba_pool_;
+    for (int i = 0; i < activated_expert; i++) {
+      auto expert_idx = m_expert_id_map_[i];
+      size_t max_m = (qlen + M_STEP - 1) / M_STEP * M_STEP;
+
+      gate_bc_[expert_idx]->max_m = max_m;
+      gate_bc_[expert_idx]->set_data(gate_bc_pool_ptr);
+      gate_bc_pool_ptr = (void*)((uintptr_t)gate_bc_pool_ptr +
+                                 align64(buffer_c_required_size(max_m, config_.intermediate_size)));
+
+      up_bc_[expert_idx]->max_m = max_m;
+      up_bc_[expert_idx]->set_data(up_bc_pool_ptr);
+      up_bc_pool_ptr =
+          (void*)((uintptr_t)up_bc_pool_ptr + align64(buffer_c_required_size(max_m, config_.intermediate_size)));
+
+      gate_up_ba_[expert_idx]->max_m = max_m;
+      gate_up_ba_[expert_idx]->set_data(gate_up_ba_pool_ptr);
+      gate_up_ba_pool_ptr =
+          (void*)((uintptr_t)gate_up_ba_pool_ptr + align64(buffer_a_required_size(max_m, config_.gateup_k())));
+      gate_up_ba_[expert_idx]->from_mat(qlen, const_cast<ggml_bf16_t*>(x_band), 0, 1);
+    }
+  }
+
+  // gate/up GEMM 스테이지: forward_decode 4단계와 동일한 work-stealing 루프.
+  // CRTP seam(do_gate_up_gemm)을 그대로 지나므로 dtype/sparse 클래스 교체에
+  // 중립이고, GEMM의 K 치수는 config_.gateup_k()가 공급한다.
+  void run_gateup_stage(int activated_expert, int qlen) {
+    auto pool = config_.pool->get_subpool(tp_part_idx);
+    int nth = T::recommended_nth(config_.intermediate_size);
+    pool->do_work_stealing_job(
+        nth * activated_expert * 2, [](int _) { T::config(); },
+        [this, nth, qlen](int task_id2) {
+          int task_id = task_id2 / 2;
+          bool do_up = task_id2 % 2;
+          int expert_idx = m_expert_id_map_[task_id / nth];
+          int ith = task_id % nth;
+          derived()->do_gate_up_gemm(do_up, expert_idx, ith, nth, qlen);
+          if (do_up) {
+            up_bc_[expert_idx]->to_mat(qlen, m_local_up_output_ptr_[expert_idx], ith, nth);
+          } else {
+            gate_bc_[expert_idx]->to_mat(qlen, m_local_gate_output_ptr_[expert_idx], ith, nth);
+          }
+        },
+        nullptr);
+  }
+
+  // export: 내부 expert-뭉치 배치(m_local_*)를 계약 slot 배치로 복사.
+  // kt가 act를 적용하던 자리를 대체하는 단계다. 이 노드는 full-width out의
+  // 자기 shard 열 [n_off, n_off+I)만 쓴다.
+  void export_gateup_partial(int qlen, int k, const int64_t* expert_ids, ggml_bf16_t* out) {
+    const size_t inter = (size_t)config_.intermediate_size;
+    const size_t n_total = (size_t)config_.n_total();
+    const size_t n_off = (size_t)tp_part_idx * inter;  // TP 균등 분할 전제 (AMX 경로 불변식)
+    if (n_off + inter > n_total) {
+      throw std::runtime_error("forward_gateup_partial: node shard exceeds n_total");
+    }
+    const size_t row_elems = 2 * n_total;
+    for (int m = 0; m < qlen; m++) {
+      for (int j = 0; j < k; j++) {
+        int64_t e = expert_ids[m * k + j];
+        if (config_.should_skip_expert(e)) {
+          continue;
+        }
+        ggml_bf16_t* dst = out + ((size_t)m * k + j) * row_elems;
+        std::memcpy(dst + n_off, m_local_gate_output_ptr_[e] + (size_t)m * inter, inter * sizeof(ggml_bf16_t));
+        std::memcpy(dst + n_total + n_off, m_local_up_output_ptr_[e] + (size_t)m * inter,
+                    inter * sizeof(ggml_bf16_t));
+      }
+    }
+  }
+
+ public:
   template <typename... Args>
   void load_weights(Args&&... args) {
     derived()->load_weights(std::forward<Args>(args)...);
