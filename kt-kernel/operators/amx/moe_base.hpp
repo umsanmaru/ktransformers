@@ -103,6 +103,28 @@ class AMX_MOE_BASE {
       config_.load = false;
     }
 
+    // Prism partial: 기하 정합을 생성 시점에 검증 (조용한 오답 방지).
+    // enabled면 모든 값이 명시여야 하고, 노드 shard는 TP ctor가 채운 상태다.
+    if (config_.is_partial()) {
+      const auto& pg = config_.partial;
+      if (pg.gateup.rows <= 0 || pg.down.rows <= 0 || pg.n_total <= 0) {
+        throw std::runtime_error("partial: enabled but gateup/down/n_total not explicit");
+      }
+      if (pg.gateup.offset < 0 || pg.gateup.offset + pg.gateup.rows > config_.hidden_size) {
+        throw std::runtime_error("partial: gateup K band out of hidden range");
+      }
+      if (pg.down.offset < 0 || pg.down.offset + pg.down.rows > pg.n_total) {
+        throw std::runtime_error("partial: down K band out of intermediate range");
+      }
+      if (pg.gateup_n.rows != config_.intermediate_size) {
+        throw std::runtime_error("partial: node gateup_n.rows != node intermediate_size");
+      }
+      if (pg.down_n.rows <= 0 || pg.down_n.offset < 0 ||
+          pg.down_n.offset + pg.down_n.rows > config_.hidden_size) {
+        throw std::runtime_error("partial: node down_n shard out of hidden range");
+      }
+    }
+
     MemoryRequest mem_requests;
     const size_t ml = config_.max_len;
     const size_t k_tok = config_.num_experts_per_tok;
@@ -132,7 +154,7 @@ class AMX_MOE_BASE {
       gate_bc_.push_back(make_buffer_c(config_.max_len, config_.intermediate_size, nullptr));
       up_bc_.push_back(make_buffer_c(config_.max_len, config_.intermediate_size, nullptr));
       down_ba_.push_back(make_buffer_a(config_.max_len, config_.down_k(), nullptr));
-      down_bc_.push_back(make_buffer_c(config_.max_len, config_.hidden_size, nullptr));
+      down_bc_.push_back(make_buffer_c(config_.max_len, config_.down_n(), nullptr));
 
       void* gate_bb_ptr =
           std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.gateup_k()));
@@ -142,8 +164,8 @@ class AMX_MOE_BASE {
       up_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.gateup_k(), up_bb_ptr));
 
       void* down_bb_ptr =
-          std::aligned_alloc(64, buffer_b_required_size(config_.hidden_size, config_.down_k()));
-      down_bb_.push_back(make_buffer_b(config_.hidden_size, config_.down_k(), down_bb_ptr));
+          std::aligned_alloc(64, buffer_b_required_size(config_.down_n(), config_.down_k()));
+      down_bb_.push_back(make_buffer_b(config_.down_n(), config_.down_k(), down_bb_ptr));
     }
     // TODO: need update to all *.hpp
     // (config_.expert_num * T::M_STEP) in pool_count_ is to ensure padding for each experts.
@@ -153,7 +175,7 @@ class AMX_MOE_BASE {
     gate_bc_pool_bytes_ = buffer_c_required_size(pool_count_, config_.intermediate_size) + pool_count_ * 64;
     up_bc_pool_bytes_ = buffer_c_required_size(pool_count_, config_.intermediate_size) + pool_count_ * 64;
     down_ba_pool_bytes_ = buffer_a_required_size(pool_count_, config_.down_k()) + pool_count_ * 64;
-    down_bc_pool_bytes_ = buffer_c_required_size(pool_count_, config_.hidden_size) + pool_count_ * 64;
+    down_bc_pool_bytes_ = buffer_c_required_size(pool_count_, config_.down_n()) + pool_count_ * 64;
 
     mem_requests.append_pointer(&gate_up_ba_pool_, gate_up_ba_pool_bytes_);
     mem_requests.append_pointer(&gate_bc_pool_, gate_bc_pool_bytes_);
@@ -305,7 +327,7 @@ class AMX_MOE_BASE {
   void export_gateup_partial(int qlen, int k, const int64_t* expert_ids, ggml_bf16_t* out) {
     const size_t inter = (size_t)config_.intermediate_size;
     const size_t n_total = (size_t)config_.n_total();
-    const size_t n_off = (size_t)tp_part_idx * inter;  // TP 균등 분할 전제 (AMX 경로 불변식)
+    const size_t n_off = (size_t)config_.partial.gateup_n.offset;  // TP ctor가 Plan/균등에서 기록
     if (n_off + inter > n_total) {
       throw std::runtime_error("forward_gateup_partial: node shard exceeds n_total");
     }
@@ -320,6 +342,117 @@ class AMX_MOE_BASE {
         std::memcpy(dst + n_off, m_local_gate_output_ptr_[e] + (size_t)m * inter, inter * sizeof(ggml_bf16_t));
         std::memcpy(dst + n_total + n_off, m_local_up_output_ptr_[e] + (size_t)m * inter,
                     inter * sizeof(ggml_bf16_t));
+      }
+    }
+  }
+
+ public:
+  // ── Prism down partial (계약 ②, K2) — gateup과 동형의 절단 ────────────
+  // forward_decode의 down 구간(입력 pack → down GEMM)만 수행하고 partial을
+  // export한다. router 가중 / expert 합산 없음 — GPU rejoin#2 소관.
+  //
+  //   act: bf16 [qlen × k × n_total(inter_FULL)] — GPU rejoin#1의 act 결과가
+  //        D2H로 내려온 것. slot j의 행에서 down K 밴드
+  //        [down.offset, +down.rows)만 읽는다.
+  //   out: bf16 [qlen × k × hidden_FULL]. down은 N(hidden) 축 노드 분할이라
+  //        이 노드는 자기 shard 열 [down_n.offset, +down_n.rows)만 쓴다.
+  //        overwrite 의미론 — skip slot 미기록(undefined).
+  void forward_down_partial(int qlen, int k, const int64_t* expert_ids, const void* act, void* out) {
+    if (qlen != 1) {
+      throw std::runtime_error("forward_down_partial: only qlen==1 (decode) is supported");
+    }
+    int activated_expert = prepare_down_routing(k, expert_ids);
+    if (activated_expert == 0) {
+      return;
+    }
+    carve_and_pack_down(k, expert_ids, qlen, (const ggml_bf16_t*)act);
+    run_down_stage(activated_expert, qlen);
+    export_down_partial(qlen, k, expert_ids, (ggml_bf16_t*)out);
+  }
+
+ private:
+  // 라우팅 준비 (down): m_local_down_output_ptr_ 배정. stride = down_n().
+  int prepare_down_routing(int k, const int64_t* expert_ids) {
+    int activated_expert = 0;
+    std::fill(m_local_num_.begin(), m_local_num_.end(), 0);
+    for (int i = 0; i < k; i++) {
+      if (config_.should_skip_expert(expert_ids[i])) {
+        continue;
+      }
+      m_expert_id_map_[activated_expert] = expert_ids[i];
+      m_local_num_[expert_ids[i]] = 1;
+      activated_expert++;
+    }
+    size_t offset = 0;
+    for (int i = 0; i < activated_expert; i++) {
+      auto expert_idx = m_expert_id_map_[i];
+      m_local_down_output_ptr_[expert_idx] = m_local_down_output_ + offset * config_.down_n();
+      offset += 1;
+    }
+    return activated_expert;
+  }
+
+  // 풀 carving + act pack: slot j의 act 행에서 down K 밴드를 pack.
+  // (qlen==1이라 slot마다 expert가 유일 — slot 순회가 곧 expert 순회)
+  void carve_and_pack_down(int k, const int64_t* expert_ids, int qlen, const ggml_bf16_t* act) {
+    constexpr size_t M_STEP = T::M_STEP;
+    auto align64 = [](size_t v) { return (v + 63) & (~(size_t)63); };
+    void* down_ba_pool_ptr = down_ba_pool_;
+    void* down_bc_pool_ptr = down_bc_pool_;
+    const size_t act_row = (size_t)config_.n_total();  // act의 slot 행 stride
+    for (int j = 0; j < k; j++) {
+      int64_t e = expert_ids[j];
+      if (config_.should_skip_expert(e)) {
+        continue;
+      }
+      size_t max_m = (qlen + M_STEP - 1) / M_STEP * M_STEP;
+
+      down_ba_[e]->max_m = max_m;
+      down_ba_[e]->set_data(down_ba_pool_ptr);
+      down_ba_pool_ptr =
+          (void*)((uintptr_t)down_ba_pool_ptr + align64(buffer_a_required_size(max_m, config_.down_k())));
+
+      down_bc_[e]->max_m = max_m;
+      down_bc_[e]->set_data(down_bc_pool_ptr);
+      down_bc_pool_ptr =
+          (void*)((uintptr_t)down_bc_pool_ptr + align64(buffer_c_required_size(max_m, config_.down_n())));
+
+      const ggml_bf16_t* src = act + (size_t)j * act_row + config_.partial.down.offset;
+      down_ba_[e]->from_mat(qlen, const_cast<ggml_bf16_t*>(src), 0, 1);
+    }
+  }
+
+  // down GEMM 스테이지: CRTP seam(do_down_gemm) 경유, N = down_n().
+  void run_down_stage(int activated_expert, int qlen) {
+    auto pool = config_.pool->get_subpool(tp_part_idx);
+    int nth = T::recommended_nth(config_.down_n());
+    pool->do_work_stealing_job(
+        nth * activated_expert, [](int _) { T::config(); },
+        [this, nth, qlen](int task_id) {
+          int expert_idx = m_expert_id_map_[task_id / nth];
+          int ith = task_id % nth;
+          derived()->do_down_gemm(expert_idx, ith, nth, qlen);
+          down_bc_[expert_idx]->to_mat(qlen, m_local_down_output_ptr_[expert_idx], ith, nth);
+        },
+        nullptr);
+  }
+
+  // export: 자기 hidden shard 열 [down_n.offset, +down_n.rows)에 직접 쓰기.
+  void export_down_partial(int qlen, int k, const int64_t* expert_ids, ggml_bf16_t* out) {
+    const size_t rows = (size_t)config_.down_n();
+    const size_t h_total = (size_t)config_.hidden_size;
+    const size_t n_off = (size_t)config_.partial.down_n.offset;
+    if (n_off + rows > h_total) {
+      throw std::runtime_error("forward_down_partial: node shard exceeds hidden_size");
+    }
+    for (int m = 0; m < qlen; m++) {
+      for (int j = 0; j < k; j++) {
+        int64_t e = expert_ids[m * k + j];
+        if (config_.should_skip_expert(e)) {
+          continue;
+        }
+        ggml_bf16_t* dst = out + ((size_t)m * k + j) * h_total;
+        std::memcpy(dst + n_off, m_local_down_output_ptr_[e] + (size_t)m * rows, rows * sizeof(ggml_bf16_t));
       }
     }
   }

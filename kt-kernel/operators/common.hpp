@@ -242,6 +242,22 @@ struct PartialGeometry {
   KRange gateup;  // gate/up 공유 (2026-08-20 확정: 두 행렬은 K·N 분할을 공유) — hidden 축
   KRange down;    // intermediate 축, global 좌표. full이면 {0, intermediate_size} 명시
   int n_total = 0;  // gate/up 출력축(intermediate)의 full 크기
+
+  // ── K2: NUMA N-shard — 전 proj가 각자의 출력축(N)으로 노드 분할 ──────
+  // (down도 N(hidden) 분할: act가 GPU rejoin을 거쳐 full-width로 돌아오므로
+  //  kt의 act-locality 결합이 없고, 노드들은 서로소 열에 직접 쓴다)
+  //
+  // top-level 테이블 (Plan이 주입; 노드 i의 shard). 비어 있으면 TP ctor가
+  // 균등 분할로 채운다. 불균등 비율 = warm 소켓의 cold 몫 축소 노브.
+  std::vector<int> node_gateup_n_offset;  // inter 축
+  std::vector<int> node_gateup_n_rows;
+  std::vector<int> node_down_n_offset;  // hidden 축
+  std::vector<int> node_down_n_rows;
+
+  // node-scope: TP ctor가 각 tp_config에 기록하는 "이 인스턴스의 N shard".
+  // (gateup_n.rows는 노드 intermediate_size와 항상 같아야 함 — init이 검증)
+  KRange gateup_n;
+  KRange down_n;
 };
 
 struct GeneralMOEConfig {
@@ -358,6 +374,8 @@ struct GeneralMOEConfig {
   // gate/up 출력축(intermediate)의 full 크기 — TP 분할 후 노드 config의
   // intermediate_size는 shard가 되므로 full-width out 열 쓰기에 필요
   inline int n_total() const { return partial.enabled ? partial.n_total : intermediate_size; }
+  // down의 출력축(hidden) 중 이 인스턴스의 shard 크기 (K2: down N-분할)
+  inline int down_n() const { return partial.enabled ? partial.down_n.rows : hidden_size; }
 
   GeneralMOEConfig() {}
 

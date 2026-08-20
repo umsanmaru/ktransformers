@@ -475,6 +475,7 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
   // 노출하면 full-K GEMM이 밴드 크기 BufferA를 읽어 조용히 틀린 값이 난다.
   if constexpr (WithPartial) {
     moe_cls.def("forward_gateup_partial", &MoeClass::forward_gateup_partial_binding);
+    moe_cls.def("forward_down_partial", &MoeClass::forward_down_partial_binding);
   }
 
   // Bind write_weight_scale_to_buffer_task for MoE types that support it
@@ -760,7 +761,15 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def_readwrite("enabled", &PartialGeometry::enabled)
       .def_readwrite("gateup", &PartialGeometry::gateup)
       .def_readwrite("down", &PartialGeometry::down)
-      .def_readwrite("n_total", &PartialGeometry::n_total);
+      .def_readwrite("n_total", &PartialGeometry::n_total)
+      // K2: NUMA N-shard 테이블 (Plan 주입; 비면 균등 분할)
+      .def_readwrite("node_gateup_n_offset", &PartialGeometry::node_gateup_n_offset)
+      .def_readwrite("node_gateup_n_rows", &PartialGeometry::node_gateup_n_rows)
+      .def_readwrite("node_down_n_offset", &PartialGeometry::node_down_n_offset)
+      .def_readwrite("node_down_n_rows", &PartialGeometry::node_down_n_rows)
+      // node-scope (TP ctor가 기록; 디버깅용 읽기)
+      .def_readonly("gateup_n", &PartialGeometry::gateup_n)
+      .def_readonly("down_n", &PartialGeometry::down_n);
 
   py::class_<GeneralMOEConfig>(moe_module, "MOEConfig")
       .def(py::init([](int expert_num, int routed_expert_num, int hidden_size, int intermediate_size) {

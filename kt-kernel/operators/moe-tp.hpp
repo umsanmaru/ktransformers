@@ -124,10 +124,51 @@ class TP_MOE_Common : public MoE_Interface {
             "multiple of NUMA node count");
       }
 
+      // Prism partial: 노드 shard를 Plan 주입 테이블에서 읽는다 (없으면 균등).
+      // 검증은 여기(호출 스레드, ctor)에서 — 테이블-노드 불일치는 즉사.
+      const auto& pg = config.partial;
+      const bool has_shard_tables = config.is_partial() && !pg.node_gateup_n_rows.empty();
+      if (has_shard_tables) {
+        auto check_table = [&](const std::vector<int>& off, const std::vector<int>& rows, int full,
+                               const char* name) {
+          if ((int)off.size() != tp_count || (int)rows.size() != tp_count) {
+            throw std::runtime_error(std::string("partial shard table size != tp_count: ") + name);
+          }
+          int sum = 0;
+          for (int i = 0; i < tp_count; i++) {
+            if (rows[i] <= 0 || off[i] < 0 || off[i] + rows[i] > full) {
+              throw std::runtime_error(std::string("partial shard table out of range: ") + name);
+            }
+            sum += rows[i];
+          }
+          if (sum != full) {
+            throw std::runtime_error(std::string("partial shard rows do not sum to full dim: ") + name);
+          }
+        };
+        check_table(pg.node_gateup_n_offset, pg.node_gateup_n_rows, config.intermediate_size, "gateup_n");
+        check_table(pg.node_down_n_offset, pg.node_down_n_rows, config.hidden_size, "down_n");
+      } else if (config.is_partial() && config.hidden_size % tp_count != 0) {
+        throw std::runtime_error("partial without shard tables: hidden_size must divide tp_count");
+      }
+
       for (auto i = 0; i < tp_count; i++) {
         tps.push_back(nullptr);
         GeneralMOEConfig tp_config = config;
-        tp_config.intermediate_size /= tp_count;
+        if (config.is_partial()) {
+          if (has_shard_tables) {
+            tp_config.intermediate_size = pg.node_gateup_n_rows[i];
+            tp_config.partial.gateup_n = {pg.node_gateup_n_offset[i], pg.node_gateup_n_rows[i]};
+            tp_config.partial.down_n = {pg.node_down_n_offset[i], pg.node_down_n_rows[i]};
+          } else {
+            const int i_node = config.intermediate_size / tp_count;
+            const int h_node = config.hidden_size / tp_count;
+            tp_config.intermediate_size = i_node;
+            tp_config.partial.gateup_n = {i * i_node, i_node};
+            tp_config.partial.down_n = {i * h_node, h_node};
+          }
+        } else {
+          tp_config.intermediate_size /= tp_count;
+        }
         tp_configs.push_back(tp_config);
       }
     }
@@ -280,6 +321,28 @@ class TP_MOE_Common : public MoE_Interface {
 
   void forward_gateup_partial_binding(intptr_t qlen_ptr, int k, intptr_t expert_ids, intptr_t input, intptr_t out) {
     forward_gateup_partial((int*)qlen_ptr, k, (const int64_t*)expert_ids, (const void*)input, (void*)out);
+  }
+
+  // ── Prism partial: down partial (계약 ②) — gateup과 동형 2단 구성 ─────
+  // down도 N(hidden) 축 열 분할이므로 각 노드가 full-width out
+  // [qlen×k×hidden]의 자기 shard 열 구간에 직접 쓴다 — 노드 합산 없음.
+  // 입력 act는 full-width [qlen×k×inter] (GPU rejoin#1 결과가 D2H로 내려온 것).
+  void forward_down_partial(int* qlen_ptr, int k, const int64_t* expert_ids, const void* act, void* out) {
+    if (weights_loaded == false) [[unlikely]] {
+      throw std::runtime_error("Not Loaded");
+    }
+    int qlen = *qlen_ptr;
+    if (qlen != 1) [[unlikely]] {
+      throw std::runtime_error("forward_down_partial: only qlen==1 (decode) is supported (K2)");
+    }
+    auto pool = config.pool;
+    pool->dispense_backend()->do_numa_job([this, qlen, k, expert_ids, act, out](int numa_id) {
+      tps[numa_id]->forward_down_partial(qlen, k, expert_ids, act, out);
+    });
+  }
+
+  void forward_down_partial_binding(intptr_t qlen_ptr, int k, intptr_t expert_ids, intptr_t act, intptr_t out) {
+    forward_down_partial((int*)qlen_ptr, k, (const int64_t*)expert_ids, (const void*)act, (void*)out);
   }
 
   virtual void load_weights() = 0;
