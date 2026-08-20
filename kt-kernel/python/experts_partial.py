@@ -69,10 +69,14 @@ class PartialMoEWrapper:
             ("up", up_proj, expect["up"]),
             ("down", down_proj, expect["down"]),
         ):
-            if t.dtype != torch.bfloat16 or tuple(t.shape) != shape or not t.is_contiguous():
+            if (t.dtype != torch.bfloat16 or tuple(t.shape) != shape
+                    or not t.is_contiguous() or t.device.type != "cpu"):
+                # device 검증 필수: CUDA 텐서의 data_ptr()는 device 주소라
+                # C++ host memcpy가 그대로 segfault한다 (조용한 죽음 방지)
                 raise ValueError(
-                    f"{name}_proj must be contiguous bf16 {shape}, got "
-                    f"{t.dtype} {tuple(t.shape)} contiguous={t.is_contiguous()}"
+                    f"{name}_proj must be contiguous CPU bf16 {shape}, got "
+                    f"{t.dtype} {tuple(t.shape)} device={t.device} "
+                    f"contiguous={t.is_contiguous()}"
                 )
         if physical_to_logical_map_cpu is None:
             physical_to_logical_map_cpu = torch.arange(cfg.expert_num, dtype=torch.int64)
