@@ -53,6 +53,16 @@ class AMX_MOE_BASE {
   std::vector<ggml_bf16_t*> m_local_up_output_ptr_;
   std::vector<ggml_bf16_t*> m_local_down_output_ptr_;
 
+  // Prism sparsity: (expert, proj)별 타일 비트마스크. 타일당 K_STEP/2(=16)
+  // 페어, 비트 1 = 유지. A를 dense로 두고 커널이 로드를 건너뛴다 (gate/up이
+  // gate_up_ba_를 공유하므로 마스크를 A에 구울 수 없다 — 계약 ①).
+  // decode(qlen==1)에서만 채워진다: prefill은 토큰별 마스크가 B 재사용을
+  // 깨서 이득이 없다 (prefill-dense).
+  std::vector<std::vector<uint16_t>> m_pair_mask_gate_;
+  std::vector<std::vector<uint16_t>> m_pair_mask_up_;
+  std::vector<std::vector<uint16_t>> m_pair_mask_down_;
+  bool m_sparse_active_ = false;  // 이 호출이 sparse 경로인가
+
   std::vector<std::shared_ptr<typename T::BufferA>> gate_up_ba_;
   std::vector<std::shared_ptr<typename T::BufferB>> gate_bb_;
   std::vector<std::shared_ptr<typename T::BufferC>> gate_bc_;
@@ -141,6 +151,13 @@ class AMX_MOE_BASE {
     }
     m_expert_id_map_.resize(config_.expert_num);
     m_local_num_.resize(config_.expert_num);
+    if (config_.partial.sparsity.enabled) {
+      const int gu_tiles = config_.gateup_k() / T::K_STEP;
+      const int dn_tiles = config_.down_k() / T::K_STEP;
+      m_pair_mask_gate_.assign(config_.expert_num, std::vector<uint16_t>(gu_tiles, 0));
+      m_pair_mask_up_.assign(config_.expert_num, std::vector<uint16_t>(gu_tiles, 0));
+      m_pair_mask_down_.assign(config_.expert_num, std::vector<uint16_t>(dn_tiles, 0));
+    }
     m_local_input_ptr_.resize(config_.expert_num);
     m_local_gate_output_ptr_.resize(config_.expert_num);
     m_local_up_output_ptr_.resize(config_.expert_num);
@@ -231,7 +248,8 @@ class AMX_MOE_BASE {
   // forward_prefill과 동형의 토큰 그룹핑(gather가 밴드 슬라이싱을 흡수 —
   // strided pack 불필요) 경로를 탄다. stage/export는 두 경로가 공유한다
   // (decode는 m_local_pos_ == 0의 퇴화형).
-  void forward_gateup_partial(int qlen, int k, const int64_t* expert_ids, const void* input, void* out) {
+  void forward_gateup_partial(int qlen, int k, const int64_t* expert_ids, const void* input, void* out,
+                              const float* thr = nullptr) {
     if (qlen == 1) {
       // full-width 입력에서 자기 밴드의 시작 — 단일 행이라 row stride 무관
       const ggml_bf16_t* x_band = (const ggml_bf16_t*)input + config_.partial.gateup.offset;
@@ -240,10 +258,14 @@ class AMX_MOE_BASE {
         return;
       }
       carve_and_pack_gateup(activated_expert, qlen, x_band);
+      build_gateup_masks(k, expert_ids, x_band, thr);
       run_gateup_stage(activated_expert, qlen);
+      m_sparse_active_ = false;
       export_gateup_partial(qlen, k, expert_ids, (ggml_bf16_t*)out);
       return;
     }
+    // prefill: 토큰별 마스크는 B 재사용을 깨서 이득이 없다 (prefill-dense).
+    m_sparse_active_ = false;
     int activated_expert = prepare_prefill_routing(qlen, k, expert_ids);
     if (activated_expert == 0) {
       return;
@@ -255,6 +277,86 @@ class AMX_MOE_BASE {
   }
 
  private:
+  // ── k2wl2 페어 마스크 (계약 ①) ────────────────────────────────────────
+  // imp_j = sqrt(max(a[2j]·x0² + a[2j+1]·x1² + 2·c[j]·x0·x1, 0)) >= thr
+  //
+  // sqrt를 피하고 e >= thr² 로 비교한다 — thr >= 0이 보장되므로(threshold
+  // 테이블이 음이 아닌 분포의 분위수) 판정이 동일하고, 밴드당 928회의
+  // sqrt가 사라진다. thr==0이면 e>=0이 항상 참이라 전량 통과 — GPU 측
+  // (imp>=0)과 같은 결론이다.
+  static void build_pair_mask(const ggml_bf16_t* src, int k_rows, const float* a_sq, const float* c, float thr,
+                              uint16_t* out) {
+    constexpr int PAIRS_PER_TILE = T::K_STEP / 2;
+    const float thr2 = thr * thr;
+    const int tiles = k_rows / T::K_STEP;
+    for (int t = 0; t < tiles; t++) {
+      uint16_t bits = 0;
+      const int base = t * PAIRS_PER_TILE;
+      for (int j = 0; j < PAIRS_PER_TILE; j++) {
+        const int p = base + j;
+        const float x0 = GGML_BF16_TO_FP32(src[2 * p]);
+        const float x1 = GGML_BF16_TO_FP32(src[2 * p + 1]);
+        float e = a_sq[2 * p] * x0 * x0 + a_sq[2 * p + 1] * x1 * x1 + 2.0f * c[p] * x0 * x1;
+        if (e < 0.0f) {
+          e = 0.0f;
+        }
+        if (e >= thr2) {
+          bits |= (uint16_t)1 << j;
+        }
+      }
+      out[t] = bits;
+    }
+  }
+
+  // slot별 (expert, proj) 마스크를 채운다. 포인터 유효성은 호출 스레드
+  // (TP_MOE::forward_*_partial)가 이미 검증했다 — worker 안의 throw는
+  // uncaught → std::terminate이므로 여기서는 던지지 않는다.
+  void build_gateup_masks(int k, const int64_t* expert_ids, const ggml_bf16_t* x_band, const float* thr) {
+    const auto& sp = config_.partial.sparsity;
+    if (!sp.enabled || thr == nullptr) {
+      m_sparse_active_ = false;
+      return;
+    }
+    const int rows = config_.gateup_k();
+    const float* g_a = (const float*)sp.gate_wn_sq;
+    const float* g_c = (const float*)sp.gate_pair_dot;
+    const float* u_a = (const float*)sp.up_wn_sq;
+    const float* u_c = (const float*)sp.up_pair_dot;
+    for (int j = 0; j < k; j++) {
+      const int64_t e = expert_ids[j];
+      if (config_.should_skip_expert(e)) {
+        continue;
+      }
+      const size_t off = (size_t)e * (size_t)rows;
+      const size_t poff = off / 2;
+      build_pair_mask(x_band, rows, g_a + off, g_c + poff, thr[j * 3 + 0], m_pair_mask_gate_[e].data());
+      build_pair_mask(x_band, rows, u_a + off, u_c + poff, thr[j * 3 + 1], m_pair_mask_up_[e].data());
+    }
+    m_sparse_active_ = true;
+  }
+
+  void build_down_masks(int k, const int64_t* expert_ids, const ggml_bf16_t* act, const float* thr) {
+    const auto& sp = config_.partial.sparsity;
+    if (!sp.enabled || thr == nullptr) {
+      m_sparse_active_ = false;
+      return;
+    }
+    const int rows = config_.down_k();
+    const float* d_a = (const float*)sp.down_wn_sq;
+    const float* d_c = (const float*)sp.down_pair_dot;
+    const size_t act_row = (size_t)config_.n_total();
+    for (int j = 0; j < k; j++) {
+      const int64_t e = expert_ids[j];
+      if (config_.should_skip_expert(e)) {
+        continue;
+      }
+      const ggml_bf16_t* src = act + (size_t)j * act_row + config_.partial.down.offset;
+      const size_t off = (size_t)e * (size_t)rows;
+      build_pair_mask(src, rows, d_a + off, d_c + off / 2, thr[j * 3 + 2], m_pair_mask_down_[e].data());
+    }
+    m_sparse_active_ = true;
+  }
+
   // 라우팅 준비: forward_decode 1단계와 동일한 멤버 상태(m_expert_id_map_,
   // m_local_num_, m_local_{gate,up}_output_ptr_)를 만든다. 반환 = 활성 expert 수.
   int prepare_gateup_routing(int k, const int64_t* expert_ids) {
@@ -468,17 +570,21 @@ class AMX_MOE_BASE {
   //   out: bf16 [qlen × k × hidden_FULL]. down은 N(hidden) 축 노드 분할이라
   //        이 노드는 자기 shard 열 [down_n.offset, +down_n.rows)만 쓴다.
   //        overwrite 의미론 — skip slot 미기록(undefined).
-  void forward_down_partial(int qlen, int k, const int64_t* expert_ids, const void* act, void* out) {
+  void forward_down_partial(int qlen, int k, const int64_t* expert_ids, const void* act, void* out,
+                            const float* thr = nullptr) {
     if (qlen == 1) {
       int activated_expert = prepare_down_routing(k, expert_ids);
       if (activated_expert == 0) {
         return;
       }
       carve_and_pack_down(k, expert_ids, qlen, (const ggml_bf16_t*)act);
+      build_down_masks(k, expert_ids, (const ggml_bf16_t*)act, thr);
       run_down_stage(activated_expert, qlen);
+      m_sparse_active_ = false;
       export_down_partial(qlen, k, expert_ids, (ggml_bf16_t*)out);
       return;
     }
+    m_sparse_active_ = false;  // prefill-dense
     int activated_expert = prepare_prefill_routing(qlen, k, expert_ids);
     if (activated_expert == 0) {
       return;

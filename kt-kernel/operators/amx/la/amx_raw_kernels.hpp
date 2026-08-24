@@ -235,6 +235,50 @@ struct GemmKernel224BF16 {
     }
   }
 
+  // Prism sparse decode kernel (계약 ①): 타일당 16비트 마스크로 살아남은
+  // k-페어만 처리한다. packed B의 k-페어 행이 정확히 __m512bh 하나(64B =
+  // 캐시라인 1개)이므로, 마스킹된 페어를 건너뛰면 B 로드 2회와 dpbf16_ps
+  // 2회/행이 그대로 사라진다 — 절감이 nnz에 비례한다.
+  //
+  // A는 dense로 남긴다: gate와 up이 gate_up_ba_를 공유하는데 두 마스크가
+  // 다르므로, 마스크를 A에 굽으면 A를 두 벌 pack해야 한다.
+  //
+  // 누산 순서가 dense와 같다 (행별로 k 오름차순) — mask가 전부 1이면
+  // avx_kernel_4와 **비트 동일**해야 하고, 그것이 이 커널의 회귀 테스트다.
+  static void avx_kernel_4_sparse(int m, int n, int k, int m_begin, int n_begin, int k_block_begin, float* c,
+                                  BufferA* ba, BufferB* bb, const uint16_t* tile_mask) {
+    __m512* c512 = (__m512*)c;
+    int m_block_end = std::min(m - m_begin, M_STEP);
+
+    if (k_block_begin == 0) {
+      for (int m_i = 0; m_i < m_block_end; m_i++) {
+        c512[m_i * 2] = _mm512_setzero_ps();
+        c512[m_i * 2 + 1] = _mm512_setzero_ps();
+      }
+    }
+
+    for (int k_begin = 0; k_begin < K_BLOCK && k_block_begin + k_begin < k; k_begin += K_STEP) {
+      uint16_t mask = tile_mask[(k_block_begin + k_begin) / K_STEP];
+      if (mask == 0) {
+        continue;  // 타일 전체 차단 — B 로드 0회
+      }
+      int32_t* a32 = (int32_t*)ba->get_submat(m, k, m_begin, k_block_begin + k_begin);
+      __m512bh* b512 = (__m512bh*)bb->get_submat(n, k, n_begin, k_block_begin + k_begin);
+
+      while (mask) {
+        int k_i = __builtin_ctz(mask);
+        mask &= (uint16_t)(mask - 1);
+        __m512bh b_lo = b512[k_i];
+        __m512bh b_hi = b512[16 + k_i];
+        for (int m_i = 0; m_i < m_block_end; m_i++) {
+          __m512bh ma = (__m512bh)_mm512_set1_epi32(a32[m_i * 16 + k_i]);
+          c512[m_i * 2] = _mm512_dpbf16_ps(c512[m_i * 2], ma, b_lo);
+          c512[m_i * 2 + 1] = _mm512_dpbf16_ps(c512[m_i * 2 + 1], ma, b_hi);
+        }
+      }
+    }
+  }
+
   // AMX kernel for BF16: process entire K_BLOCK using AMX tiles
   static void amx_kernel(int m, int n, int k, int m_begin, int n_begin, int k_block_begin, float* c, BufferA* ba,
                          BufferB* bb) {
@@ -602,6 +646,25 @@ inline void vec_mul(int m, int n, int k, std::shared_ptr<GemmKernel224BF16::Buff
                     std::shared_ptr<GemmKernel224BF16::BufferB> bb, std::shared_ptr<GemmKernel224BF16::BufferC> bc,
                     int ith, int nth) {
   float_mat_vec<GemmKernel224BF16, false>(m, n, k, ba.get(), bb.get(), bc.get(), ith, nth);
+}
+
+// Prism sparse decode GEMV. float_mat_vec와 같은 루프이고 내부 커널만 다르다.
+inline void vec_mul_sparse(int m, int n, int k, std::shared_ptr<GemmKernel224BF16::BufferA> ba,
+                           std::shared_ptr<GemmKernel224BF16::BufferB> bb,
+                           std::shared_ptr<GemmKernel224BF16::BufferC> bc, int ith, int nth,
+                           const uint16_t* tile_mask) {
+  using K = GemmKernel224BF16;
+  assert(n % K::N_STEP == 0);
+  assert(k % K::K_STEP == 0);
+  auto [n_start, n_end] = K::split_range_n(n, ith, nth);
+  for (int k_block_begin = 0; k_block_begin < k; k_block_begin += K::K_BLOCK) {
+    for (int m_begin = 0; m_begin < m; m_begin += K::M_STEP) {
+      for (int n_begin = n_start; n_begin < n_end; n_begin += K::N_STEP) {
+        float* c = bc->get_submat(m, n, m_begin, n_begin);
+        K::avx_kernel_4_sparse(m, n, k, m_begin, n_begin, k_block_begin, c, ba.get(), bb.get(), tile_mask);
+      }
+    }
+  }
 }
 
 inline void vec_mul_kgroup(int m, int n, int k, int k_group_size, std::shared_ptr<GemmKernel224FP8::BufferA> ba,

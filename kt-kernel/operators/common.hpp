@@ -258,6 +258,26 @@ struct PartialGeometry {
   // (gateup_n.rows는 노드 intermediate_size와 항상 같아야 함 — init이 검증)
   KRange gateup_n;
   KRange down_n;
+
+  // ── 입력기반 sparsity (k2wl2, 계약 ①) ────────────────────────────────
+  // 점수 재료는 weight와 같은 수명이다 (로드 시 주입, host 상주 NUMA-local).
+  // 전부 이 인스턴스의 **cold K 밴드로 절단된** fp32 테이블이고, expert 축이
+  // 앞이다: *_wn_sq = [E, rows] (= wn², a), *_pair_dot = [E, rows/2] (= c).
+  // gate와 up은 K 밴드를 공유하지만 노름·내적·threshold가 모두 다르므로
+  // 테이블도 따로 받는다.
+  //
+  // threshold는 step마다 바뀌므로 여기 없다 — forward 인자로 온다.
+  struct SparsityGeometry {
+    bool enabled = false;
+    // void*는 GeneralMOEConfig의 weight 포인터들과 같은 관례 (DEF_PTR_PROPERTY).
+    void* gate_wn_sq = nullptr;
+    void* gate_pair_dot = nullptr;
+    void* up_wn_sq = nullptr;
+    void* up_pair_dot = nullptr;
+    void* down_wn_sq = nullptr;
+    void* down_pair_dot = nullptr;
+  };
+  SparsityGeometry sparsity;
 };
 
 struct GeneralMOEConfig {

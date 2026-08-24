@@ -33,6 +33,10 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
 
  protected:
   using Base::config_;
+  using Base::m_pair_mask_down_;
+  using Base::m_pair_mask_gate_;
+  using Base::m_pair_mask_up_;
+  using Base::m_sparse_active_;
   using Base::down_ba_;
   using Base::down_bb_;
   using Base::down_bc_;
@@ -99,6 +103,14 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
     auto& bb = do_up ? up_bb_[expert_idx] : gate_bb_[expert_idx];
     auto& bc = do_up ? up_bc_[expert_idx] : gate_bc_[expert_idx];
 
+    // Prism sparse decode: 타일 마스크가 준비된 호출만 sparse GEMV를 탄다.
+    // (prefill은 mat_mul로 가고 m_sparse_active_가 false다 — prefill-dense)
+    if (m_sparse_active_) {
+      const uint16_t* mask =
+          (do_up ? m_pair_mask_up_ : m_pair_mask_gate_)[expert_idx].data();
+      amx::vec_mul_sparse(m, config_.intermediate_size, config_.gateup_k(), ba, bb, bc, ith, nth, mask);
+      return;
+    }
     // Use vec_mul/mat_mul (no group_size)
     // K 치수는 접근자 경유 — partial 인스턴스면 밴드 크기, 아니면 full (동일)
     if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
@@ -111,6 +123,11 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
   void do_down_gemm(int expert_idx, int ith, int nth, int qlen) {
     int m = m_local_num_[expert_idx];
 
+    if (m_sparse_active_) {
+      amx::vec_mul_sparse(m, config_.down_n(), config_.down_k(), down_ba_[expert_idx], down_bb_[expert_idx],
+                          down_bc_[expert_idx], ith, nth, m_pair_mask_down_[expert_idx].data());
+      return;
+    }
     if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
       amx::mat_mul(m, config_.down_n(), config_.down_k(), down_ba_[expert_idx], down_bb_[expert_idx],
                    down_bc_[expert_idx], ith, nth);
