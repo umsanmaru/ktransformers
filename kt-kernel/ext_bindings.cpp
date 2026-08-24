@@ -264,17 +264,17 @@ class MOEBindings {
       intptr_t expert_ids;
       intptr_t input;
       intptr_t out;
-      intptr_t thr;  // sparsity threshold [qlen][k][3] fp32 pinned (0 = dense)
+      intptr_t weights;  // 라우터 가중 [qlen][k] fp32 pinned (0 = dense)
     };
     static void inner(void* args) {
       Args* args_ = (Args*)args;
       args_->cpuinfer->enqueue(&TP_MOE<T>::forward_gateup_partial_binding, args_->moe, args_->qlen, args_->k,
-                               args_->expert_ids, args_->input, args_->out, args_->thr);
+                               args_->expert_ids, args_->input, args_->out, args_->weights);
     }
     static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE<T>> moe, intptr_t qlen, int k,
                                                             intptr_t expert_ids, intptr_t input, intptr_t out,
-                                                            intptr_t thr) {
-      Args* args = new Args{nullptr, moe.get(), qlen, k, expert_ids, input, out, thr};
+                                                            intptr_t weights) {
+      Args* args = new Args{nullptr, moe.get(), qlen, k, expert_ids, input, out, weights};
       return std::make_pair((intptr_t)&inner, (intptr_t)args);
     }
   };
@@ -289,17 +289,17 @@ class MOEBindings {
       intptr_t expert_ids;
       intptr_t act;
       intptr_t out;
-      intptr_t thr;  // sparsity threshold [qlen][k][3] fp32 pinned (0 = dense)
+      intptr_t weights;  // 라우터 가중 [qlen][k] fp32 pinned (0 = dense)
     };
     static void inner(void* args) {
       Args* args_ = (Args*)args;
       args_->cpuinfer->enqueue(&TP_MOE<T>::forward_down_partial_binding, args_->moe, args_->qlen, args_->k,
-                               args_->expert_ids, args_->act, args_->out, args_->thr);
+                               args_->expert_ids, args_->act, args_->out, args_->weights);
     }
     static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE<T>> moe, intptr_t qlen, int k,
                                                             intptr_t expert_ids, intptr_t act, intptr_t out,
-                                                            intptr_t thr) {
-      Args* args = new Args{nullptr, moe.get(), qlen, k, expert_ids, act, out, thr};
+                                                            intptr_t weights) {
+      Args* args = new Args{nullptr, moe.get(), qlen, k, expert_ids, act, out, weights};
       return std::make_pair((intptr_t)&inner, (intptr_t)args);
     }
   };
@@ -531,16 +531,16 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
     // 동기 경로 (테스트/eager 직접 호출). thr 기본값 0 = dense — sparsity가
     // 없던 시절의 5-인자 호출이 그대로 유효하다.
     moe_cls.def("forward_gateup_partial", &MoeClass::forward_gateup_partial_binding, py::arg("qlen_ptr"),
-                py::arg("k"), py::arg("expert_ids"), py::arg("input"), py::arg("out"), py::arg("thr") = 0);
+                py::arg("k"), py::arg("expert_ids"), py::arg("input"), py::arg("out"), py::arg("weights") = 0);
     moe_cls.def("forward_down_partial", &MoeClass::forward_down_partial_binding, py::arg("qlen_ptr"), py::arg("k"),
-                py::arg("expert_ids"), py::arg("act"), py::arg("out"), py::arg("thr") = 0);
+                py::arg("expert_ids"), py::arg("act"), py::arg("out"), py::arg("weights") = 0);
     // task 경로 (CPUInfer.submit[_with_cuda_stream] 용 (fn, args) 쌍)
     moe_cls.def("forward_gateup_partial_task", &MoeBindings::GateupPartialBindings::cpuinfer_interface,
                 py::arg("qlen"), py::arg("k"), py::arg("expert_ids"), py::arg("input"), py::arg("out"),
-                py::arg("thr") = 0);
+                py::arg("weights") = 0);
     moe_cls.def("forward_down_partial_task", &MoeBindings::DownPartialBindings::cpuinfer_interface,
                 py::arg("qlen"), py::arg("k"), py::arg("expert_ids"), py::arg("act"), py::arg("out"),
-                py::arg("thr") = 0);
+                py::arg("weights") = 0);
   }
 
   // Bind write_weight_scale_to_buffer_task for MoE types that support it
@@ -830,7 +830,20 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .DEF_PTR_PROPERTY(PartialGeometry::SparsityGeometry, up_wn_sq)
       .DEF_PTR_PROPERTY(PartialGeometry::SparsityGeometry, up_pair_dot)
       .DEF_PTR_PROPERTY(PartialGeometry::SparsityGeometry, down_wn_sq)
-      .DEF_PTR_PROPERTY(PartialGeometry::SparsityGeometry, down_pair_dot);
+      .DEF_PTR_PROPERTY(PartialGeometry::SparsityGeometry, down_pair_dot)
+      .DEF_PTR_PROPERTY(PartialGeometry::SparsityGeometry, thr_gate)
+      .DEF_PTR_PROPERTY(PartialGeometry::SparsityGeometry, thr_up)
+      .DEF_PTR_PROPERTY(PartialGeometry::SparsityGeometry, thr_down)
+      .def_readwrite("p_gate", &PartialGeometry::SparsityGeometry::p_gate)
+      .def_readwrite("lam_gate", &PartialGeometry::SparsityGeometry::lam_gate)
+      .def_readwrite("p_up", &PartialGeometry::SparsityGeometry::p_up)
+      .def_readwrite("lam_up", &PartialGeometry::SparsityGeometry::lam_up)
+      .def_readwrite("p_down", &PartialGeometry::SparsityGeometry::p_down)
+      .def_readwrite("lam_down", &PartialGeometry::SparsityGeometry::lam_down)
+      .def_readwrite("pmax", &PartialGeometry::SparsityGeometry::pmax)
+      .def_readwrite("grid", &PartialGeometry::SparsityGeometry::grid)
+      .def_readwrite("ng", &PartialGeometry::SparsityGeometry::ng)
+      .def_readwrite("renorm_it", &PartialGeometry::SparsityGeometry::renorm_it);
 
   py::class_<PartialGeometry>(moe_module, "PartialGeometry")
       .def(py::init<>())

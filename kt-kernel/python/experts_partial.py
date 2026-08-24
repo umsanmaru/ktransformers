@@ -16,10 +16,12 @@ staging(x/act/expert_ids/partial out)은 sglang prism ExecutionResources가
 이 wrapper 핸들의 수명 = cold weight의 수명.
 
 **sparsity 테이블은 수명 규칙이 다르다**: weight는 pack되어 C++ 소유로
-넘어가지만, wn_sq/pair_dot은 C++가 **매 step 원시 포인터로 읽는다**.
-따라서 이 wrapper가 wrapper 수명 내내 참조를 들고 있어야 한다 (놓으면
-dangling → segfault). threshold는 반대로 step마다 갱신되는 호출자 소유
-pinned 버퍼이고 포인터만 인자로 온다 (계약 ④).
+넘어가지만, 점수 재료(wn_sq/pair_dot)와 threshold 곡선(thr_*)은 C++가
+**매 step 원시 포인터로 읽는다**. 따라서 이 wrapper가 wrapper 수명 내내
+참조를 들고 있어야 한다 (놓으면 dangling → segfault).
+
+step마다 오는 것은 라우터 가중 하나뿐이다 — 예산 → s → 격자 조회 → 마스크
+판정이 전부 C++에서 끝난다 (계약 ④).
 """
 
 from __future__ import annotations
@@ -66,11 +68,14 @@ class PartialMoEWrapper:
     ) -> None:
         """sparsity_tables: 주면 sparse decode가 켜진다 (없으면 dense).
 
-        키 6개 전부 필요하고 전부 fp32 contiguous CPU여야 한다:
-          gate_wn_sq/up_wn_sq   [E, gateup_k]      = wn^2
-          gate_pair_dot/up_pair_dot [E, gateup_k/2] = 인접열 내적
+        키 9개 전부 필요하고 전부 fp32 contiguous CPU여야 한다:
+          gate_wn_sq/up_wn_sq       [E, gateup_k]    = wn^2
+          gate_pair_dot/up_pair_dot [E, gateup_k/2]  = 인접열 내적
           down_wn_sq [E, down_k] / down_pair_dot [E, down_k/2]
-        전부 이 인스턴스의 K 밴드로 이미 절단된 것이어야 한다.
+          thr_gate/thr_up/thr_down  [E, ng]          = threshold 곡선
+        점수 재료는 이 인스턴스의 K 밴드로 절단된 것이어야 하고, thr 곡선은
+        밴드와 무관하므로 절단하지 않는다. 예산(p/lam/pmax/grid/ng/renorm_it)은
+        config.partial.sparsity에 미리 채워져 있어야 한다.
         """
         if self._moe is not None:
             raise RuntimeError("weights already loaded")
@@ -112,6 +117,7 @@ class PartialMoEWrapper:
         self._cpuinfer.sync()  # pack 동기 완료
         self._pending = None  # 소스 텐서 해제 — 이후 소유권은 C++ (계약 ③)
 
+    # (키, 축 종류, 나눔) — 축 "grid"는 밴드와 무관한 threshold 곡선이다.
     _SPARSITY_KEYS = (
         ("gate_wn_sq", "gateup", 1),
         ("gate_pair_dot", "gateup", 2),
@@ -119,6 +125,9 @@ class PartialMoEWrapper:
         ("up_pair_dot", "gateup", 2),
         ("down_wn_sq", "down", 1),
         ("down_pair_dot", "down", 2),
+        ("thr_gate", "grid", 1),
+        ("thr_up", "grid", 1),
+        ("thr_down", "grid", 1),
     )
 
     def _install_sparsity(self, cfg, tables: dict) -> None:
@@ -126,7 +135,14 @@ class PartialMoEWrapper:
         missing = [n for n, _, _ in self._SPARSITY_KEYS if n not in tables]
         if missing:
             raise ValueError(f"sparsity_tables missing keys: {missing}")
-        rows = {"gateup": cfg.partial.gateup.rows, "down": cfg.partial.down.rows}
+        sp = cfg.partial.sparsity
+        if sp.ng <= 1 or sp.grid <= 0.0:
+            raise ValueError(
+                f"config.partial.sparsity grid not set (ng={sp.ng}, grid={sp.grid}) "
+                f"— 예산은 테이블 설치 전에 채워져야 한다"
+            )
+        rows = {"gateup": cfg.partial.gateup.rows, "down": cfg.partial.down.rows,
+                "grid": sp.ng}
         kept = {}
         for name, band, div in self._SPARSITY_KEYS:
             t = tables[name]
@@ -141,7 +157,6 @@ class PartialMoEWrapper:
             kept[name] = t
         # C++가 매 step 원시 포인터로 읽으므로 wrapper 수명 내내 붙잡는다.
         self._sparsity_tables = kept
-        sp = cfg.partial.sparsity
         for name in kept:
             setattr(sp, name, kept[name].data_ptr())
         sp.enabled = True
@@ -154,20 +169,20 @@ class PartialMoEWrapper:
     # ── task 경로: (fn, args)를 CPUInfer로 제출 (graph-호환 배관) ─────────
     # 모든 포인터 인자는 정수 주소(intptr). qlen_ptr가 가리키는 int는
     # pinned·주소고정이어야 하며 값은 step마다 in-place 갱신 (계약 ④).
-    # thr_ptr: fp32 [qlen][k][3] (gate, up, down) pinned. 0 = dense.
-    # sparse는 decode 전용이므로 qlen != 1에 thr을 주면 C++가 즉사시킨다.
+    # weights_ptr: fp32 [qlen][k] 라우터 가중 pinned. 0 = dense.
+    # sparse는 decode 전용이므로 qlen != 1에 주면 C++가 즉사시킨다.
     def submit_forward_gateup(self, qlen_ptr: int, k: int, expert_ids_ptr: int,
                               x_ptr: int, out_ptr: int, cuda_stream: Optional[int] = None,
-                              thr_ptr: int = 0) -> None:
+                              weights_ptr: int = 0) -> None:
         task = self._require_loaded().forward_gateup_partial_task(
-            qlen_ptr, k, expert_ids_ptr, x_ptr, out_ptr, thr_ptr)
+            qlen_ptr, k, expert_ids_ptr, x_ptr, out_ptr, weights_ptr)
         self._submit(task, cuda_stream)
 
     def submit_forward_down(self, qlen_ptr: int, k: int, expert_ids_ptr: int,
                             act_ptr: int, out_ptr: int, cuda_stream: Optional[int] = None,
-                            thr_ptr: int = 0) -> None:
+                            weights_ptr: int = 0) -> None:
         task = self._require_loaded().forward_down_partial_task(
-            qlen_ptr, k, expert_ids_ptr, act_ptr, out_ptr, thr_ptr)
+            qlen_ptr, k, expert_ids_ptr, act_ptr, out_ptr, weights_ptr)
         self._submit(task, cuda_stream)
 
     def _submit(self, task, cuda_stream: Optional[int]) -> None:
@@ -186,17 +201,17 @@ class PartialMoEWrapper:
 
     # ── 동기 편의 (테스트/eager) — kt BaseMoEWrapper.forward의 대응물 ─────
     def forward_gateup(self, expert_ids: torch.Tensor, x: torch.Tensor, out: torch.Tensor,
-                       thr: Optional[torch.Tensor] = None) -> None:
+                       weights: Optional[torch.Tensor] = None) -> None:
         qlen_t = torch.tensor([x.shape[0]], dtype=torch.int32)
         self._require_loaded().forward_gateup_partial(
             qlen_t.data_ptr(), expert_ids.shape[1], expert_ids.data_ptr(), x.data_ptr(), out.data_ptr(),
-            0 if thr is None else thr.data_ptr()
+            0 if weights is None else weights.data_ptr()
         )
 
     def forward_down(self, expert_ids: torch.Tensor, act: torch.Tensor, out: torch.Tensor,
-                     thr: Optional[torch.Tensor] = None) -> None:
+                     weights: Optional[torch.Tensor] = None) -> None:
         qlen_t = torch.tensor([act.shape[0]], dtype=torch.int32)
         self._require_loaded().forward_down_partial(
             qlen_t.data_ptr(), expert_ids.shape[1], expert_ids.data_ptr(), act.data_ptr(), out.data_ptr(),
-            0 if thr is None else thr.data_ptr()
+            0 if weights is None else weights.data_ptr()
         )

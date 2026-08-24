@@ -300,7 +300,7 @@ class TP_MOE_Common : public MoE_Interface {
   // rejoin). T가 forward_gateup_partial을 제공할 때만 인스턴스화되는
   // 템플릿-지연 메서드다 (llamafile 등 미지원 백엔드는 바인딩하지 않음).
   void forward_gateup_partial(int* qlen_ptr, int k, const int64_t* expert_ids, const void* input, void* out,
-                              const float* thr = nullptr) {
+                              const float* weights = nullptr) {
     if (weights_loaded == false) [[unlikely]] {
       throw std::runtime_error("Not Loaded");
     }
@@ -314,13 +314,14 @@ class TP_MOE_Common : public MoE_Interface {
       // 상위 config의 n_total은 full inter와 같아야 노드 shard 열 쓰기가 안전
       throw std::runtime_error("forward_gateup_partial: partial.n_total != full intermediate_size");
     }
-    // sparsity 계약 (계약 ①): thr이 오면 반드시 decode(qlen==1)이고 테이블이
-    // 있어야 한다. 조용히 dense로 흐르면 캘리브가 의도한 수치와 달라진다.
-    // 검증은 반드시 호출 스레드에서 — worker 안의 throw는 std::terminate다.
+    // sparsity 계약 (계약 ①): 라우터 가중이 오면 반드시 decode(qlen==1)이고
+    // 테이블·격자가 갖춰져 있어야 한다. 조용히 dense로 흐르면 캘리브가 의도한
+    // 수치와 달라진다. 검증은 반드시 호출 스레드에서 — worker 안의 throw는
+    // std::terminate다.
     const auto& sp_gu = config.partial.sparsity;
-    if (thr != nullptr) {
+    if (weights != nullptr) {
       if (!sp_gu.enabled) {
-        throw std::runtime_error("forward_gateup_partial: thr given but partial.sparsity.enabled is false");
+        throw std::runtime_error("forward_gateup_partial: weights given but partial.sparsity.enabled is false");
       }
       if (qlen != 1) {
         throw std::runtime_error("forward_gateup_partial: sparsity is decode-only (qlen must be 1)");
@@ -328,17 +329,23 @@ class TP_MOE_Common : public MoE_Interface {
       if (!sp_gu.gate_wn_sq || !sp_gu.gate_pair_dot || !sp_gu.up_wn_sq || !sp_gu.up_pair_dot) {
         throw std::runtime_error("forward_gateup_partial: sparsity enabled but gate/up tables are null");
       }
+      if (!sp_gu.thr_gate || !sp_gu.thr_up) {
+        throw std::runtime_error("forward_gateup_partial: sparsity enabled but gate/up thr curves are null");
+      }
+      if (sp_gu.ng <= 1 || sp_gu.grid <= 0.0f) {
+        throw std::runtime_error("forward_gateup_partial: sparsity grid (ng, grid) not configured");
+      }
     }
     auto pool = config.pool;
-    pool->dispense_backend()->do_numa_job([this, qlen, k, expert_ids, input, out, thr](int numa_id) {
-      tps[numa_id]->forward_gateup_partial(qlen, k, expert_ids, input, out, thr);
+    pool->dispense_backend()->do_numa_job([this, qlen, k, expert_ids, input, out, weights](int numa_id) {
+      tps[numa_id]->forward_gateup_partial(qlen, k, expert_ids, input, out, weights);
     });
   }
 
   void forward_gateup_partial_binding(intptr_t qlen_ptr, int k, intptr_t expert_ids, intptr_t input, intptr_t out,
-                                      intptr_t thr) {
+                                      intptr_t weights) {
     forward_gateup_partial((int*)qlen_ptr, k, (const int64_t*)expert_ids, (const void*)input, (void*)out,
-                           (const float*)thr);
+                           (const float*)weights);
   }
 
   // ── Prism partial: down partial (계약 ②) — gateup과 동형 2단 구성 ─────
@@ -346,7 +353,7 @@ class TP_MOE_Common : public MoE_Interface {
   // [qlen×k×hidden]의 자기 shard 열 구간에 직접 쓴다 — 노드 합산 없음.
   // 입력 act는 full-width [qlen×k×inter] (GPU rejoin#1 결과가 D2H로 내려온 것).
   void forward_down_partial(int* qlen_ptr, int k, const int64_t* expert_ids, const void* act, void* out,
-                            const float* thr = nullptr) {
+                            const float* weights = nullptr) {
     if (weights_loaded == false) [[unlikely]] {
       throw std::runtime_error("Not Loaded");
     }
@@ -355,27 +362,30 @@ class TP_MOE_Common : public MoE_Interface {
       throw std::runtime_error("forward_down_partial: qlen out of range [1, max_len]");
     }
     const auto& sp_dn = config.partial.sparsity;
-    if (thr != nullptr) {
+    if (weights != nullptr) {
       if (!sp_dn.enabled) {
-        throw std::runtime_error("forward_down_partial: thr given but partial.sparsity.enabled is false");
+        throw std::runtime_error("forward_down_partial: weights given but partial.sparsity.enabled is false");
       }
       if (qlen != 1) {
         throw std::runtime_error("forward_down_partial: sparsity is decode-only (qlen must be 1)");
       }
-      if (!sp_dn.down_wn_sq || !sp_dn.down_pair_dot) {
+      if (!sp_dn.down_wn_sq || !sp_dn.down_pair_dot || !sp_dn.thr_down) {
         throw std::runtime_error("forward_down_partial: sparsity enabled but down tables are null");
+      }
+      if (sp_dn.ng <= 1 || sp_dn.grid <= 0.0f) {
+        throw std::runtime_error("forward_down_partial: sparsity grid (ng, grid) not configured");
       }
     }
     auto pool = config.pool;
-    pool->dispense_backend()->do_numa_job([this, qlen, k, expert_ids, act, out, thr](int numa_id) {
-      tps[numa_id]->forward_down_partial(qlen, k, expert_ids, act, out, thr);
+    pool->dispense_backend()->do_numa_job([this, qlen, k, expert_ids, act, out, weights](int numa_id) {
+      tps[numa_id]->forward_down_partial(qlen, k, expert_ids, act, out, weights);
     });
   }
 
   void forward_down_partial_binding(intptr_t qlen_ptr, int k, intptr_t expert_ids, intptr_t act, intptr_t out,
-                                    intptr_t thr) {
+                                    intptr_t weights) {
     forward_down_partial((int*)qlen_ptr, k, (const int64_t*)expert_ids, (const void*)act, (void*)out,
-                         (const float*)thr);
+                         (const float*)weights);
   }
 
   virtual void load_weights() = 0;

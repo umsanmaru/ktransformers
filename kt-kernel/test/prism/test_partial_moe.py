@@ -94,26 +94,26 @@ def make_routing(qlen):
     ).contiguous()
 
 
-def run_gateup(moe, expert_ids, x, thr=None):
+def run_gateup(moe, expert_ids, x, weights=None):
     qlen_t = torch.tensor([x.shape[0]], dtype=torch.int32)
     out = torch.full(
         (x.shape[0], num_experts_per_tok, 2 * intermediate_size), 777.0, dtype=torch.bfloat16
     ).contiguous()
     moe.forward_gateup_partial(
         qlen_t.data_ptr(), num_experts_per_tok, expert_ids.data_ptr(), x.data_ptr(), out.data_ptr(),
-        0 if thr is None else thr.data_ptr()
+        0 if weights is None else weights.data_ptr()
     )
     return out
 
 
-def run_down(moe, expert_ids, act, thr=None):
+def run_down(moe, expert_ids, act, weights=None):
     qlen_t = torch.tensor([act.shape[0]], dtype=torch.int32)
     out = torch.full(
         (act.shape[0], num_experts_per_tok, hidden_size), 777.0, dtype=torch.bfloat16
     ).contiguous()
     moe.forward_down_partial(
         qlen_t.data_ptr(), num_experts_per_tok, expert_ids.data_ptr(), act.data_ptr(), out.data_ptr(),
-        0 if thr is None else thr.data_ptr()
+        0 if weights is None else weights.data_ptr()
     )
     return out
 
@@ -370,22 +370,26 @@ if __name__ == "__main__":
 
 
 # ===========================================================================
-# 입력기반 sparsity (k2wl2) — 계약 ① / sglang prism sparsity.py의 CPU 짝
+# 입력기반 sparsity (k2wl2) — 계약 ①
 # ===========================================================================
 #
-# 검증 전략: sparse 커널은 dense 커널과 **누산 순서가 같도록** 만들었고,
-# 마스킹된 페어는 dense에서 a=0이 되어 c + 0*b = c (정확)이다. 따라서
+# 예산(p, lam, pmax, grid, ng, renorm_it)과 threshold 곡선이 config/테이블에
+# 상주하고, step마다 오는 것은 라우터 가중 하나다. 그래서 유효 threshold를
+# 특정 값으로 고정하려면 **thr 곡선을 그 값으로 채운다** — 격자 인덱스가
+# 무엇이든 조회 결과가 같아지므로 s를 우회할 수 있다.
+#
+# 검증 전략: 마스킹된 페어는 dense에서 a=0이 되어 c + 0*b = c (정확)이므로
 #
 #     sparse(x, mask)  ==  dense(mask 적용된 x)      (비트 단위)
-#
-# 가 성립해야 한다. tolerance가 아니라 비트일치로 검증할 수 있는 이유다.
+
+SP_NG, SP_GRID, SP_PMAX, SP_RENORM = 201, 0.005, 0.9, 3
 
 
-def sparsity_tables_from_weights(gate_cold, up_cold, down_cold):
-    """cold weight에서 점수 재료를 유도한다 (calib과 같은 정의).
+def sparsity_tables_from_weights(gate_cold, up_cold, down_cold,
+                                 thr_g=0.0, thr_u=0.0, thr_d=0.0, ng=SP_NG):
+    """cold weight에서 점수 재료를 유도하고 thr 곡선은 상수로 채운다.
 
-    wn_sq[j] = ||W[:, j]||²  (출력 행에 대한 노름의 제곱 = a)
-    pair_dot[p] = <W[:, 2p], W[:, 2p+1]>                    (= c)
+    wn_sq[j] = ||W[:, j]||²  (= a) / pair_dot[p] = <W[:,2p], W[:,2p+1]>  (= c)
     합성 난수가 아니라 실제 weight에서 뽑으므로 부호·스케일이 실전과 같다.
     """
 
@@ -398,22 +402,28 @@ def sparsity_tables_from_weights(gate_cold, up_cold, down_cold):
     g_a, g_c = of(gate_cold)
     u_a, u_c = of(up_cold)
     d_a, d_c = of(down_cold)
+    full = lambda v: torch.full((expert_num, ng), float(v), dtype=torch.float32)
     return {
         "gate_wn_sq": g_a, "gate_pair_dot": g_c,
         "up_wn_sq": u_a, "up_pair_dot": u_c,
         "down_wn_sq": d_a, "down_pair_dot": d_c,
+        "thr_gate": full(thr_g), "thr_up": full(thr_u), "thr_down": full(thr_d),
     }
 
 
-def install_sparsity(config, tables):
-    sp = config.partial.sparsity
-    for name, t in tables.items():
-        setattr(sp, name, t.data_ptr())
-    sp.enabled = True
+def ramp_thr_tables(tables, cutoff_idx, ng=SP_NG):
+    """격자 인덱스 < cutoff면 0, 그 이상은 차단. s의 방향을 관찰 가능하게 만든다."""
+    step = torch.full((expert_num, ng), 1e9, dtype=torch.float32)
+    step[:, :cutoff_idx] = 0.0
+    out = dict(tables)
+    for key in ("thr_gate", "thr_up", "thr_down"):
+        out[key] = step.clone()
+    return out
 
 
-def build_sparse_moe(gate_cold, up_cold, down_cold, cpuinfer, tables):
-    """build_partial_moe와 같지만 sparsity 테이블을 설치한다.
+def build_sparse_moe(gate_cold, up_cold, down_cold, cpuinfer, tables,
+                     p=0.5, lam=0.0):
+    """build_partial_moe와 같지만 sparsity 예산 + 테이블을 설치한다.
 
     테이블은 C++가 step마다 원시 포인터로 읽으므로 호출자가 붙잡고 있어야
     한다 — 여기서는 tables dict가 테스트 스코프에 살아 있다.
@@ -435,7 +445,14 @@ def build_sparse_moe(gate_cold, up_cold, down_cold, cpuinfer, tables):
     config.up_scale = 0
     config.down_scale = 0
     config.pool = cpuinfer.backend_
-    install_sparsity(config, tables)
+
+    sp = config.partial.sparsity
+    sp.pmax, sp.grid, sp.ng, sp.renorm_it = SP_PMAX, SP_GRID, SP_NG, SP_RENORM
+    sp.p_gate = sp.p_up = sp.p_down = p
+    sp.lam_gate = sp.lam_up = sp.lam_down = lam
+    for name, t in tables.items():
+        setattr(sp, name, t.data_ptr())
+    sp.enabled = True
 
     moe = kt_kernel_ext.moe.AMXBF16_MOE(config)
     phys_map = torch.arange(expert_num, dtype=torch.int64).contiguous()
@@ -444,15 +461,16 @@ def build_sparse_moe(gate_cold, up_cold, down_cold, cpuinfer, tables):
     return moe
 
 
-def make_thr(qlen, gate=0.0, up=0.0, down=0.0):
-    """[qlen, k, 3] fp32 — 순서는 (gate, up, down)."""
-    t = torch.zeros(qlen, num_experts_per_tok, 3, dtype=torch.float32)
-    t[:, :, 0], t[:, :, 1], t[:, :, 2] = gate, up, down
-    return t.contiguous()
+def router_weights(qlen, values=None):
+    """[qlen, k] fp32. values를 주면 그 행을 모든 토큰에 쓴다."""
+    if values is None:
+        return torch.rand(qlen, num_experts_per_tok, dtype=torch.float32).contiguous()
+    row = torch.tensor(values, dtype=torch.float32)
+    return row.unsqueeze(0).repeat(qlen, 1).contiguous()
 
 
 def pair_energy(vec_band, a_sq, c):
-    """C++ build_pair_mask의 e (clamp 전 제곱 에너지). fp32로 계산."""
+    """C++ build_pair_mask의 e (clamp 후 제곱 에너지). fp32로 계산."""
     x = vec_band.float()
     x0, x1 = x[0::2], x[1::2]
     e = a_sq[0::2] * x0 * x0 + a_sq[1::2] * x1 * x1 + 2.0 * c * x0 * x1
@@ -471,8 +489,8 @@ def mask_band_(full, offset, rows, keep_pairs):
 def pick_threshold(energies):
     """정렬된 e의 중앙 두 값 사이 중점. 판정이 float 오차로 흔들리지 않는다.
 
-    파이썬 쪽 마스크도 C++와 똑같이 `thr*thr`로 비교하므로, sqrt 왕복 오차가
-    있어도 두 판정은 정확히 일치한다.
+    파이썬 쪽 마스크도 C++와 똑같이 `thr*thr`로 비교하므로 sqrt 왕복 오차가
+    있어도 두 판정이 정확히 일치한다.
     """
     flat = torch.cat([e.reshape(-1) for e in energies]).sort().values
     n = flat.numel()
@@ -496,10 +514,10 @@ def test_sparse_zero_threshold_bitexact_with_dense():
     ids = make_routing(1)
     x = randn_gen((1, hidden_size)).contiguous()
     act = randn_gen((1, num_experts_per_tok, intermediate_size)).contiguous()
-    thr = make_thr(1)
+    w = router_weights(1)
 
-    assert torch.equal(run_gateup(sparse, ids, x, thr), run_gateup(dense, ids, x))
-    assert torch.equal(run_down(sparse, ids, act, thr), run_down(dense, ids, act))
+    assert torch.equal(run_gateup(sparse, ids, x, w), run_gateup(dense, ids, x))
+    assert torch.equal(run_down(sparse, ids, act, w), run_down(dense, ids, act))
 
 
 @pytest.mark.cpu
@@ -507,17 +525,18 @@ def test_sparse_huge_threshold_zeroes_output():
     """전량 차단 → 타일 마스크가 0이라 B 로드 없이 0이 export된다."""
     torch.manual_seed(21)
     gate_cold, up_cold, down_cold = make_weights(randn_gen)
-    tables = sparsity_tables_from_weights(gate_cold, up_cold, down_cold)
+    tables = sparsity_tables_from_weights(gate_cold, up_cold, down_cold,
+                                          thr_g=1e9, thr_u=1e9, thr_d=1e9)
     cpuinfer = kt_kernel_ext.CPUInfer(CPUINFER_PARAM)
     sparse = build_sparse_moe(gate_cold, up_cold, down_cold, cpuinfer, tables)
 
     ids = make_routing(1)
     x = randn_gen((1, hidden_size)).contiguous()
     act = randn_gen((1, num_experts_per_tok, intermediate_size)).contiguous()
-    thr = make_thr(1, gate=1e9, up=1e9, down=1e9)
+    w = router_weights(1)
 
-    assert torch.count_nonzero(run_gateup(sparse, ids, x, thr)) == 0
-    assert torch.count_nonzero(run_down(sparse, ids, act, thr)) == 0
+    assert torch.count_nonzero(run_gateup(sparse, ids, x, w)) == 0
+    assert torch.count_nonzero(run_down(sparse, ids, act, w)) == 0
 
 
 @pytest.mark.cpu
@@ -530,24 +549,24 @@ def test_sparse_gateup_matches_masked_dense():
     """
     torch.manual_seed(22)
     gate_cold, up_cold, down_cold = make_weights(randn_gen)
-    tables = sparsity_tables_from_weights(gate_cold, up_cold, down_cold)
+    base = sparsity_tables_from_weights(gate_cold, up_cold, down_cold)
     cpuinfer = kt_kernel_ext.CPUInfer(CPUINFER_PARAM)
     dense = build_partial_moe(gate_cold, up_cold, down_cold, cpuinfer)
-    sparse = build_sparse_moe(gate_cold, up_cold, down_cold, cpuinfer, tables)
 
     ids = make_routing(1)
     x = randn_gen((1, hidden_size)).contiguous()
     band = x[0, GATEUP_K_OFFSET : GATEUP_K_OFFSET + GATEUP_K_ROWS]
-
     experts = [int(ids[0, j]) for j in range(num_experts_per_tok)]
-    e_gate = [pair_energy(band, tables["gate_wn_sq"][e], tables["gate_pair_dot"][e])
+    e_gate = [pair_energy(band, base["gate_wn_sq"][e], base["gate_pair_dot"][e])
               for e in experts]
-    e_up = [pair_energy(band, tables["up_wn_sq"][e], tables["up_pair_dot"][e])
+    e_up = [pair_energy(band, base["up_wn_sq"][e], base["up_pair_dot"][e])
             for e in experts]
-    thr_g = pick_threshold(e_gate)
-    thr_u = pick_threshold(e_up)
+    thr_g, thr_u = pick_threshold(e_gate), pick_threshold(e_up)
 
-    out = run_gateup(sparse, ids, x, make_thr(1, gate=thr_g, up=thr_u))
+    tables = sparsity_tables_from_weights(gate_cold, up_cold, down_cold,
+                                          thr_g=thr_g, thr_u=thr_u)
+    sparse = build_sparse_moe(gate_cold, up_cold, down_cold, cpuinfer, tables)
+    out = run_gateup(sparse, ids, x, router_weights(1))
 
     kept_total = 0
     for j, e in enumerate(experts):
@@ -568,21 +587,22 @@ def test_sparse_gateup_matches_masked_dense():
 def test_sparse_down_matches_masked_dense():
     torch.manual_seed(23)
     gate_cold, up_cold, down_cold = make_weights(randn_gen)
-    tables = sparsity_tables_from_weights(gate_cold, up_cold, down_cold)
+    base = sparsity_tables_from_weights(gate_cold, up_cold, down_cold)
     cpuinfer = kt_kernel_ext.CPUInfer(CPUINFER_PARAM)
     dense = build_partial_moe(gate_cold, up_cold, down_cold, cpuinfer)
-    sparse = build_sparse_moe(gate_cold, up_cold, down_cold, cpuinfer, tables)
 
     ids = make_routing(1)
     act = randn_gen((1, num_experts_per_tok, intermediate_size)).contiguous()
     experts = [int(ids[0, j]) for j in range(num_experts_per_tok)]
     energies = [
         pair_energy(act[0, j, DOWN_K_OFFSET : DOWN_K_OFFSET + DOWN_K_ROWS],
-                    tables["down_wn_sq"][e], tables["down_pair_dot"][e])
+                    base["down_wn_sq"][e], base["down_pair_dot"][e])
         for j, e in enumerate(experts)
     ]
     thr_d = pick_threshold(energies)
-    out = run_down(sparse, ids, act, make_thr(1, down=thr_d))
+    tables = sparsity_tables_from_weights(gate_cold, up_cold, down_cold, thr_d=thr_d)
+    sparse = build_sparse_moe(gate_cold, up_cold, down_cold, cpuinfer, tables)
+    out = run_down(sparse, ids, act, router_weights(1))
 
     kept_total = 0
     for j in range(num_experts_per_tok):
@@ -598,9 +618,41 @@ def test_sparse_down_matches_masked_dense():
 
 
 @pytest.mark.cpu
-def test_sparse_rejects_prefill():
-    """sparsity는 decode 전용 (계약 ①) — qlen>1에 thr을 주면 즉사."""
+def test_lambda_shifts_budget_by_router_weight():
+    """gate-dynamic λ의 방향 검증 — 라우터 가중이 큰 slot을 덜 자른다.
+
+    thr 곡선을 계단(격자 < cutoff면 0, 이상은 차단)으로 두면 s가 곧 관찰
+    가능해진다. λ>0에서 큰 가중의 slot은 s가 작아져 dense가 되고, 작은
+    가중의 slot은 s가 pmax로 밀려 전량 차단된다. λ=0이면 둘 다 s=p로
+    같아져 함께 차단된다 — 이 대비가 s 수식이 배선됐는지의 증거다.
+    """
     torch.manual_seed(24)
+    gate_cold, up_cold, down_cold = make_weights(randn_gen)
+    base = sparsity_tables_from_weights(gate_cold, up_cold, down_cold)
+    # p=0.5 → 격자 100. cutoff 50이면 s<0.25만 통과한다.
+    tables = ramp_thr_tables(base, cutoff_idx=50)
+    cpuinfer = kt_kernel_ext.CPUInfer(CPUINFER_PARAM)
+
+    ids = make_routing(1)
+    x = randn_gen((1, hidden_size)).contiguous()
+    w = router_weights(1, values=[0.9, 0.1])  # slot 0이 지배적
+
+    lam0 = build_sparse_moe(gate_cold, up_cold, down_cold, cpuinfer, tables,
+                            p=0.5, lam=0.0)
+    out0 = run_gateup(lam0, ids, x, w)
+    assert torch.count_nonzero(out0) == 0, "λ=0이면 두 slot 모두 s=p=0.5 → 차단"
+
+    lam20 = build_sparse_moe(gate_cold, up_cold, down_cold, cpuinfer, tables,
+                             p=0.5, lam=20.0)
+    out20 = run_gateup(lam20, ids, x, w)
+    assert torch.count_nonzero(out20[0, 0]) > 0, "가중 큰 slot은 dense여야 한다"
+    assert torch.count_nonzero(out20[0, 1]) == 0, "가중 작은 slot은 차단돼야 한다"
+
+
+@pytest.mark.cpu
+def test_sparse_rejects_prefill():
+    """sparsity는 decode 전용 (계약 ①) — qlen>1에 가중을 주면 즉사."""
+    torch.manual_seed(25)
     gate_cold, up_cold, down_cold = make_weights(randn_gen)
     tables = sparsity_tables_from_weights(gate_cold, up_cold, down_cold)
     cpuinfer = kt_kernel_ext.CPUInfer(CPUINFER_PARAM)
@@ -609,13 +661,13 @@ def test_sparse_rejects_prefill():
     ids = make_routing(4)
     x = randn_gen((4, hidden_size)).contiguous()
     with pytest.raises(RuntimeError, match="decode-only"):
-        run_gateup(sparse, ids, x, make_thr(4, gate=1.0))
+        run_gateup(sparse, ids, x, router_weights(4))
 
 
 @pytest.mark.cpu
-def test_sparse_rejects_thr_without_tables():
-    """sparsity를 끈 인스턴스에 thr을 주면 조용히 dense로 흐르지 않고 즉사."""
-    torch.manual_seed(25)
+def test_sparse_rejects_weights_without_tables():
+    """sparsity를 끈 인스턴스에 가중을 주면 조용히 dense로 흐르지 않고 즉사."""
+    torch.manual_seed(26)
     gate_cold, up_cold, down_cold = make_weights(randn_gen)
     cpuinfer = kt_kernel_ext.CPUInfer(CPUINFER_PARAM)
     dense = build_partial_moe(gate_cold, up_cold, down_cold, cpuinfer)
@@ -623,4 +675,4 @@ def test_sparse_rejects_thr_without_tables():
     ids = make_routing(1)
     x = randn_gen((1, hidden_size)).contiguous()
     with pytest.raises(RuntimeError, match="sparsity.enabled is false"):
-        run_gateup(dense, ids, x, make_thr(1, gate=1.0))
+        run_gateup(dense, ids, x, router_weights(1))

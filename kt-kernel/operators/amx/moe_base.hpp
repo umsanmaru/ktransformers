@@ -62,6 +62,8 @@ class AMX_MOE_BASE {
   std::vector<std::vector<uint16_t>> m_pair_mask_up_;
   std::vector<std::vector<uint16_t>> m_pair_mask_down_;
   bool m_sparse_active_ = false;  // 이 호출이 sparse 경로인가
+  // s 벡터의 스택 상한 (num_experts_per_tok). 넘으면 ctor에서 즉사한다.
+  static constexpr int kMaxTopK = 64;
 
   std::vector<std::shared_ptr<typename T::BufferA>> gate_up_ba_;
   std::vector<std::shared_ptr<typename T::BufferB>> gate_bb_;
@@ -152,6 +154,9 @@ class AMX_MOE_BASE {
     m_expert_id_map_.resize(config_.expert_num);
     m_local_num_.resize(config_.expert_num);
     if (config_.partial.sparsity.enabled) {
+      if (config_.num_experts_per_tok > kMaxTopK) {
+        throw std::runtime_error("prism sparsity: num_experts_per_tok exceeds kMaxTopK");
+      }
       const int gu_tiles = config_.gateup_k() / T::K_STEP;
       const int dn_tiles = config_.down_k() / T::K_STEP;
       m_pair_mask_gate_.assign(config_.expert_num, std::vector<uint16_t>(gu_tiles, 0));
@@ -249,7 +254,7 @@ class AMX_MOE_BASE {
   // strided pack 불필요) 경로를 탄다. stage/export는 두 경로가 공유한다
   // (decode는 m_local_pos_ == 0의 퇴화형).
   void forward_gateup_partial(int qlen, int k, const int64_t* expert_ids, const void* input, void* out,
-                              const float* thr = nullptr) {
+                              const float* weights = nullptr) {
     if (qlen == 1) {
       // full-width 입력에서 자기 밴드의 시작 — 단일 행이라 row stride 무관
       const ggml_bf16_t* x_band = (const ggml_bf16_t*)input + config_.partial.gateup.offset;
@@ -258,7 +263,7 @@ class AMX_MOE_BASE {
         return;
       }
       carve_and_pack_gateup(activated_expert, qlen, x_band);
-      build_gateup_masks(k, expert_ids, x_band, thr);
+      build_gateup_masks(k, expert_ids, x_band, weights);
       run_gateup_stage(activated_expert, qlen);
       m_sparse_active_ = false;
       export_gateup_partial(qlen, k, expert_ids, (ggml_bf16_t*)out);
@@ -308,12 +313,64 @@ class AMX_MOE_BASE {
     }
   }
 
+  // 예산 → s 벡터 (계약 ①). w는 [k] 라우터 가중으로, 정규화되지 않았을 수
+  // 있으므로 여기서 한 번 더 나눈다 (멱등) — lam과 gbar의 스케일이 곧 마스크
+  // 세기이므로 calib(twn = tw / tw.sum)과 어긋나면 안 된다.
+  //
+  // 재정규화가 s의 **평균**을 쓰므로 slot 하나만 따로 구할 수 없다: k개를 한
+  // 번에 채운다 (k는 num_experts_per_tok, 보통 8).
+  static void slot_sparsity(const float* w, int k, float p, float lam, float pmax, int renorm_it,
+                            float* s) {
+    float sum = 0.0f;
+    for (int i = 0; i < k; i++) {
+      sum += w[i];
+    }
+    const float inv = 1.0f / (sum > 1e-9f ? sum : 1e-9f);
+    float gbar = 0.0f;
+    for (int i = 0; i < k; i++) {
+      gbar += w[i] * inv;
+    }
+    gbar /= (float)k;
+    auto clip = [pmax](float v) { return v < 0.0f ? 0.0f : (v > pmax ? pmax : v); };
+    for (int i = 0; i < k; i++) {
+      s[i] = clip(p - lam * (w[i] * inv - gbar));
+    }
+    for (int it = 0; it < renorm_it; it++) {
+      float mean = 0.0f;
+      for (int i = 0; i < k; i++) {
+        mean += s[i];
+      }
+      mean /= (float)k;
+      if (mean < 1e-6f) {
+        mean = 1e-6f;
+      }
+      const float scale = p / mean;
+      for (int i = 0; i < k; i++) {
+        s[i] = clip(s[i] * scale);
+      }
+    }
+  }
+
+  // 격자 조회. lrint는 기본 반올림 모드가 round-half-to-even이라 torch
+  // .round()와 같은 결정을 낸다 (경계에서 갈리면 마스크가 조용히 달라진다).
+  static float thr_of(const float* tab, int64_t e, int ng, float grid, float s) {
+    long idx = std::lrint(s / grid);
+    if (idx < 0) {
+      idx = 0;
+    }
+    if (idx > (long)ng - 1) {
+      idx = (long)ng - 1;
+    }
+    return tab[e * (int64_t)ng + idx];
+  }
+
   // slot별 (expert, proj) 마스크를 채운다. 포인터 유효성은 호출 스레드
   // (TP_MOE::forward_*_partial)가 이미 검증했다 — worker 안의 throw는
   // uncaught → std::terminate이므로 여기서는 던지지 않는다.
-  void build_gateup_masks(int k, const int64_t* expert_ids, const ggml_bf16_t* x_band, const float* thr) {
+  void build_gateup_masks(int k, const int64_t* expert_ids, const ggml_bf16_t* x_band,
+                          const float* weights) {
     const auto& sp = config_.partial.sparsity;
-    if (!sp.enabled || thr == nullptr) {
+    if (!sp.enabled || weights == nullptr) {
       m_sparse_active_ = false;
       return;
     }
@@ -322,6 +379,13 @@ class AMX_MOE_BASE {
     const float* g_c = (const float*)sp.gate_pair_dot;
     const float* u_a = (const float*)sp.up_wn_sq;
     const float* u_c = (const float*)sp.up_pair_dot;
+    const float* g_t = (const float*)sp.thr_gate;
+    const float* u_t = (const float*)sp.thr_up;
+
+    float s_gate[kMaxTopK], s_up[kMaxTopK];
+    slot_sparsity(weights, k, sp.p_gate, sp.lam_gate, sp.pmax, sp.renorm_it, s_gate);
+    slot_sparsity(weights, k, sp.p_up, sp.lam_up, sp.pmax, sp.renorm_it, s_up);
+
     for (int j = 0; j < k; j++) {
       const int64_t e = expert_ids[j];
       if (config_.should_skip_expert(e)) {
@@ -329,22 +393,30 @@ class AMX_MOE_BASE {
       }
       const size_t off = (size_t)e * (size_t)rows;
       const size_t poff = off / 2;
-      build_pair_mask(x_band, rows, g_a + off, g_c + poff, thr[j * 3 + 0], m_pair_mask_gate_[e].data());
-      build_pair_mask(x_band, rows, u_a + off, u_c + poff, thr[j * 3 + 1], m_pair_mask_up_[e].data());
+      build_pair_mask(x_band, rows, g_a + off, g_c + poff,
+                      thr_of(g_t, e, sp.ng, sp.grid, s_gate[j]), m_pair_mask_gate_[e].data());
+      build_pair_mask(x_band, rows, u_a + off, u_c + poff,
+                      thr_of(u_t, e, sp.ng, sp.grid, s_up[j]), m_pair_mask_up_[e].data());
     }
     m_sparse_active_ = true;
   }
 
-  void build_down_masks(int k, const int64_t* expert_ids, const ggml_bf16_t* act, const float* thr) {
+  void build_down_masks(int k, const int64_t* expert_ids, const ggml_bf16_t* act,
+                        const float* weights) {
     const auto& sp = config_.partial.sparsity;
-    if (!sp.enabled || thr == nullptr) {
+    if (!sp.enabled || weights == nullptr) {
       m_sparse_active_ = false;
       return;
     }
     const int rows = config_.down_k();
     const float* d_a = (const float*)sp.down_wn_sq;
     const float* d_c = (const float*)sp.down_pair_dot;
+    const float* d_t = (const float*)sp.thr_down;
     const size_t act_row = (size_t)config_.n_total();
+
+    float s_down[kMaxTopK];
+    slot_sparsity(weights, k, sp.p_down, sp.lam_down, sp.pmax, sp.renorm_it, s_down);
+
     for (int j = 0; j < k; j++) {
       const int64_t e = expert_ids[j];
       if (config_.should_skip_expert(e)) {
@@ -352,7 +424,8 @@ class AMX_MOE_BASE {
       }
       const ggml_bf16_t* src = act + (size_t)j * act_row + config_.partial.down.offset;
       const size_t off = (size_t)e * (size_t)rows;
-      build_pair_mask(src, rows, d_a + off, d_c + off / 2, thr[j * 3 + 2], m_pair_mask_down_[e].data());
+      build_pair_mask(src, rows, d_a + off, d_c + off / 2,
+                      thr_of(d_t, e, sp.ng, sp.grid, s_down[j]), m_pair_mask_down_[e].data());
     }
     m_sparse_active_ = true;
   }
@@ -571,14 +644,14 @@ class AMX_MOE_BASE {
   //        이 노드는 자기 shard 열 [down_n.offset, +down_n.rows)만 쓴다.
   //        overwrite 의미론 — skip slot 미기록(undefined).
   void forward_down_partial(int qlen, int k, const int64_t* expert_ids, const void* act, void* out,
-                            const float* thr = nullptr) {
+                            const float* weights = nullptr) {
     if (qlen == 1) {
       int activated_expert = prepare_down_routing(k, expert_ids);
       if (activated_expert == 0) {
         return;
       }
       carve_and_pack_down(k, expert_ids, qlen, (const ggml_bf16_t*)act);
-      build_down_masks(k, expert_ids, (const ggml_bf16_t*)act, thr);
+      build_down_masks(k, expert_ids, (const ggml_bf16_t*)act, weights);
       run_down_stage(activated_expert, qlen);
       m_sparse_active_ = false;
       export_down_partial(qlen, k, expert_ids, (ggml_bf16_t*)out);

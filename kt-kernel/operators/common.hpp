@@ -266,7 +266,14 @@ struct PartialGeometry {
   // gate와 up은 K 밴드를 공유하지만 노름·내적·threshold가 모두 다르므로
   // 테이블도 따로 받는다.
   //
-  // threshold는 step마다 바뀌므로 여기 없다 — forward 인자로 온다.
+  // threshold 곡선과 예산도 여기 상주한다 (2026-08-24). step마다 오는 것은
+  // 라우터 가중뿐이고, 예산 → s → 격자 조회 → 판정이 전부 이쪽에서 끝난다:
+  //
+  //   s   = clip(p - lam*(g_e - gbar), 0, pmax)   # renorm_it회 재정규화
+  //   thr = thr_*[expert * ng + round(s / grid)]
+  //
+  // GPU가 thr을 소비하지 않으므로(warm은 dense) 계산해서 내려보내던 왕복을
+  // 없앤 것이다. thr_* 는 [E, ng] fp32 host 테이블.
   struct SparsityGeometry {
     bool enabled = false;
     // void*는 GeneralMOEConfig의 weight 포인터들과 같은 관례 (DEF_PTR_PROPERTY).
@@ -276,6 +283,17 @@ struct PartialGeometry {
     void* up_pair_dot = nullptr;
     void* down_wn_sq = nullptr;
     void* down_pair_dot = nullptr;
+    void* thr_gate = nullptr;
+    void* thr_up = nullptr;
+    void* thr_down = nullptr;
+    // 예산: proj별 (p, lam) + 격자 공통값.
+    float p_gate = 0.0f, lam_gate = 0.0f;
+    float p_up = 0.0f, lam_up = 0.0f;
+    float p_down = 0.0f, lam_down = 0.0f;
+    float pmax = 0.0f;
+    float grid = 0.0f;
+    int ng = 0;
+    int renorm_it = 0;
   };
   SparsityGeometry sparsity;
 };
