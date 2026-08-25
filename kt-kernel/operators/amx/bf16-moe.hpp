@@ -43,6 +43,7 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
   using Base::gate_bb_;
   using Base::gate_bc_;
   using Base::gate_up_ba_;
+  using Base::up_ba_;
   using Base::m_local_num_;
   using Base::tp_part_idx;
   using Base::up_bb_;
@@ -99,25 +100,28 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
 
   void do_gate_up_gemm(bool do_up, int expert_idx, int ith, int nth, int qlen) {
     int m = m_local_num_[expert_idx];
-    auto& ba = gate_up_ba_[expert_idx];
+    // dual-pack이면 up이 자기 pack을 갖는다. 기하가 같으면 pack을 공유한다 —
+    // 그 경우 이 분기는 항상 gate_up_ba_로 떨어져 이전과 같은 경로다.
+    auto& ba = (do_up && config_.dual_pack()) ? up_ba_[expert_idx] : gate_up_ba_[expert_idx];
     auto& bb = do_up ? up_bb_[expert_idx] : gate_bb_[expert_idx];
     auto& bc = do_up ? up_bc_[expert_idx] : gate_bc_[expert_idx];
+    const int gu_k = do_up ? config_.up_k(expert_idx) : config_.gate_k(expert_idx);
 
     // Prism sparse decode: 타일 마스크가 준비된 호출만 sparse GEMV를 탄다.
     // (prefill은 mat_mul로 가고 m_sparse_active_가 false다 — prefill-dense)
     if (m_sparse_active_) {
       const uint16_t* mask =
           (do_up ? m_pair_mask_up_ : m_pair_mask_gate_)[expert_idx].data();
-      amx::vec_mul_sparse(m, config_.intermediate_size, config_.gateup_k(expert_idx), ba, bb, bc, ith, nth,
+      amx::vec_mul_sparse(m, config_.intermediate_size, gu_k, ba, bb, bc, ith, nth,
                           mask);
       return;
     }
     // Use vec_mul/mat_mul (no group_size)
     // K 치수는 접근자 경유 — partial 인스턴스면 밴드 크기, 아니면 full (동일)
     if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
-      amx::mat_mul(m, config_.intermediate_size, config_.gateup_k(expert_idx), ba, bb, bc, ith, nth);
+      amx::mat_mul(m, config_.intermediate_size, gu_k, ba, bb, bc, ith, nth);
     } else {
-      amx::vec_mul(m, config_.intermediate_size, config_.gateup_k(expert_idx), ba, bb, bc, ith, nth);
+      amx::vec_mul(m, config_.intermediate_size, gu_k, ba, bb, bc, ith, nth);
     }
   }
 
@@ -202,13 +206,14 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
           // expert stride = 노드 스테이징 [I_node, gateup_k] — K 치수는 접근자
           // expert 블록은 ckpt 방향 [I, k(e)]이므로 시작 원소가
           // I * row_base(e)다. 균일 밴드에서는 e*I*rows와 같다.
-          const size_t gu_base =
-              (size_t)config_.intermediate_size * (size_t)config_.gateup_row_base(logical_expert_id);
-          gate_bb_[expert_idx]->from_mat((ggml_bf16_t*)config_.gate_proj + gu_base, ith,
-                                         nth);  // 3 parameters: (bf16*, ith, nth)
+          const size_t I = (size_t)config_.intermediate_size;
+          gate_bb_[expert_idx]->from_mat(
+              (ggml_bf16_t*)config_.gate_proj + I * (size_t)config_.gate_row_base(logical_expert_id), ith,
+              nth);  // 3 parameters: (bf16*, ith, nth)
 
-          // Up: same
-          up_bb_[expert_idx]->from_mat((ggml_bf16_t*)config_.up_proj + gu_base, ith, nth);
+          // Up: 자기 인덱스의 오프셋 (gate와 같으면 같은 값)
+          up_bb_[expert_idx]->from_mat(
+              (ggml_bf16_t*)config_.up_proj + I * (size_t)config_.up_row_base(logical_expert_id), ith, nth);
         },
         nullptr);
 
@@ -482,13 +487,13 @@ class TP_MOE<AMX_BF16_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_BF16_MOE_TP
     // expert별 시작은 row_base(e)로 잡는다 (균일 밴드면 e*rows와 동일).
     pool->dispense_backend()->do_numa_job([&, this](int i) {
       auto& tpc = tps[i]->config_;
-      const size_t tp_gateup_total =
-          (size_t)tpc.intermediate_size * (size_t)tpc.gateup_row_base(tpc.expert_num);
+      const size_t tp_gate_total = (size_t)tpc.intermediate_size * (size_t)tpc.gate_row_base(tpc.expert_num);
+      const size_t tp_up_total = (size_t)tpc.intermediate_size * (size_t)tpc.up_row_base(tpc.expert_num);
       const size_t tp_down_total = (size_t)tpc.down_n() * (size_t)tpc.down_row_base(tpc.expert_num);
 
       // Allocate BF16 weights (2 bytes/element)
-      tpc.gate_proj = new ggml_bf16_t[tp_gateup_total];
-      tpc.up_proj = new ggml_bf16_t[tp_gateup_total];
+      tpc.gate_proj = new ggml_bf16_t[tp_gate_total];
+      tpc.up_proj = new ggml_bf16_t[tp_up_total];
       tpc.down_proj = new ggml_bf16_t[tp_down_total];
 
       const size_t tp_idx = (size_t)i;
@@ -502,20 +507,23 @@ class TP_MOE<AMX_BF16_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_BF16_MOE_TP
           tpc.expert_num, nullptr,
           [&](int expert_id_) {
             const size_t expert_id = expert_map(physical_to_logical_map, expert_id_);
-            const size_t gu_k = (size_t)config.gateup_k(expert_id);
+            const size_t g_k = (size_t)config.gate_k(expert_id);
+            const size_t u_k = (size_t)config.up_k(expert_id);
             const size_t dn_k = (size_t)config.down_k(expert_id);
-            const size_t tp_gateup_elems = (size_t)tpc.intermediate_size * gu_k;
+            const size_t tp_gate_elems = (size_t)tpc.intermediate_size * g_k;
+            const size_t tp_up_elems = (size_t)tpc.intermediate_size * u_k;
             const size_t tp_down_elems = (size_t)tpc.down_n() * dn_k;
-            const size_t full_gateup_base =
-                (size_t)config.intermediate_size * (size_t)config.gateup_row_base(expert_id);
+            const size_t full_gate_base =
+                (size_t)config.intermediate_size * (size_t)config.gate_row_base(expert_id);
+            const size_t full_up_base =
+                (size_t)config.intermediate_size * (size_t)config.up_row_base(expert_id);
             const size_t full_down_base =
                 (size_t)config.hidden_size * (size_t)config.down_row_base(expert_id);
-            const size_t gate_up_weight_src_offset = gate_up_n_off * gu_k;
 
             ggml_bf16_t* gate_dst =
-                (ggml_bf16_t*)tpc.gate_proj + (size_t)tpc.intermediate_size * (size_t)tpc.gateup_row_base(expert_id);
+                (ggml_bf16_t*)tpc.gate_proj + (size_t)tpc.intermediate_size * (size_t)tpc.gate_row_base(expert_id);
             ggml_bf16_t* up_dst =
-                (ggml_bf16_t*)tpc.up_proj + (size_t)tpc.intermediate_size * (size_t)tpc.gateup_row_base(expert_id);
+                (ggml_bf16_t*)tpc.up_proj + (size_t)tpc.intermediate_size * (size_t)tpc.up_row_base(expert_id);
             ggml_bf16_t* down_dst =
                 (ggml_bf16_t*)tpc.down_proj + (size_t)tpc.down_n() * (size_t)tpc.down_row_base(expert_id);
 
@@ -524,18 +532,18 @@ class TP_MOE<AMX_BF16_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_BF16_MOE_TP
             const ggml_bf16_t* down_src;
 
             if (use_per_expert_ptrs) {
-              gate_src = (const ggml_bf16_t*)config.gate_projs[0][expert_id] + gate_up_weight_src_offset;
-              up_src = (const ggml_bf16_t*)config.up_projs[0][expert_id] + gate_up_weight_src_offset;
+              gate_src = (const ggml_bf16_t*)config.gate_projs[0][expert_id] + gate_up_n_off * g_k;
+              up_src = (const ggml_bf16_t*)config.up_projs[0][expert_id] + gate_up_n_off * u_k;
               down_src = (const ggml_bf16_t*)config.down_projs[0][expert_id];
             } else {
-              gate_src = (const ggml_bf16_t*)config.gate_proj + full_gateup_base + gate_up_weight_src_offset;
-              up_src = (const ggml_bf16_t*)config.up_proj + full_gateup_base + gate_up_weight_src_offset;
+              gate_src = (const ggml_bf16_t*)config.gate_proj + full_gate_base + gate_up_n_off * g_k;
+              up_src = (const ggml_bf16_t*)config.up_proj + full_up_base + gate_up_n_off * u_k;
               down_src = (const ggml_bf16_t*)config.down_proj + full_down_base;
             }
 
             // Copy gate and up weights
-            std::memcpy(gate_dst, gate_src, tp_gateup_elems * sizeof(ggml_bf16_t));
-            std::memcpy(up_dst, up_src, tp_gateup_elems * sizeof(ggml_bf16_t));
+            std::memcpy(gate_dst, gate_src, tp_gate_elems * sizeof(ggml_bf16_t));
+            std::memcpy(up_dst, up_src, tp_up_elems * sizeof(ggml_bf16_t));
 
             if (config.is_partial()) {
               // K2 down N(hidden)-split: 소스 [H, down_k]의 행 슬라이스

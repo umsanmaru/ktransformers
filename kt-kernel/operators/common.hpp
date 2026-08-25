@@ -282,12 +282,20 @@ struct KIndex {
     }
     return m;
   }
+
+  inline bool same_as(const KIndex& o) const {
+    return offset == o.offset && rows == o.rows && row_off == o.row_off && idx == o.idx;
+  }
 };
 
 struct PartialGeometry {
   bool enabled = false;
-  KIndex gateup;  // gate/up 공유 — hidden 축 (독립화는 dual-pack과 함께, K5)
-  KIndex down;    // intermediate 축, global 좌표. full이면 {0, intermediate_size} 명시
+  // gate와 up은 **독립**이다 (2026-08-25). 기하가 같으면 pack을 공유하고,
+  // 다르면 activation을 두 번 pack한다 (dual-pack) — A 풀이 2배가 되는 것이
+  // 이 자유도의 값이다. 같은 값을 넣으면 이전과 완전히 같은 경로를 탄다.
+  KIndex gate;  // hidden 축
+  KIndex up;    // hidden 축
+  KIndex down;  // intermediate 축, global 좌표. full이면 {0, intermediate_size} 명시
   int n_total = 0;  // gate/up 출력축(intermediate)의 full 크기
 
   // ── K2: NUMA N-shard — 전 proj가 각자의 출력축(N)으로 노드 분할 ──────
@@ -452,17 +460,25 @@ struct GeneralMOEConfig {
   PartialGeometry partial;
 
   inline bool is_partial() const { return partial.enabled; }
-  // gate/up의 contraction 축(hidden) 행 수 — **expert별**.
-  // 무인자 판을 남기지 않은 것은 의도다: 가변 K에서 "이 자리가 per-expert인가
-  // 최악치인가"를 컴파일러가 강제로 묻게 한다 (틀리면 조용한 오답이다).
-  inline int gateup_k(int e) const { return partial.enabled ? partial.gateup.k(e) : hidden_size; }
-  inline int gateup_k_max() const { return partial.enabled ? partial.gateup.k_max() : hidden_size; }
-  // down의 contraction 축(intermediate, global 좌표) 행 수
+  // contraction 축 행 수 — **expert별**. 무인자 판을 남기지 않은 것은 의도다:
+  // 가변 K에서 "이 자리가 per-expert인가 최악치인가"를 컴파일러가 강제로 묻게
+  // 한다 (틀리면 조용한 오답이다).
+  inline int gate_k(int e) const { return partial.enabled ? partial.gate.k(e) : hidden_size; }
+  inline int up_k(int e) const { return partial.enabled ? partial.up.k(e) : hidden_size; }
   inline int down_k(int e) const { return partial.enabled ? partial.down.k(e) : intermediate_size; }
+  // 풀 산정용 최악치. gate/up 풀은 하나를 나눠 쓰므로 둘의 최대다.
+  inline int gateup_k_max() const {
+    return partial.enabled ? std::max(partial.gate.k_max(), partial.up.k_max()) : hidden_size;
+  }
   inline int down_k_max() const { return partial.enabled ? partial.down.k_max() : intermediate_size; }
+  // gate와 up의 기하가 달라 activation을 두 번 pack해야 하는가.
+  inline bool dual_pack() const { return partial.enabled && !partial.gate.same_as(partial.up); }
   // 주입 weight에서 expert e 블록의 시작 행 (열 수는 호출부가 곱한다)
-  inline int64_t gateup_row_base(int e) const {
-    return partial.enabled ? partial.gateup.row_base(e) : (int64_t)e * hidden_size;
+  inline int64_t gate_row_base(int e) const {
+    return partial.enabled ? partial.gate.row_base(e) : (int64_t)e * hidden_size;
+  }
+  inline int64_t up_row_base(int e) const {
+    return partial.enabled ? partial.up.row_base(e) : (int64_t)e * hidden_size;
   }
   inline int64_t down_row_base(int e) const {
     return partial.enabled ? partial.down.row_base(e) : (int64_t)e * intermediate_size;

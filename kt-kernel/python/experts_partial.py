@@ -32,6 +32,11 @@ import torch
 
 from kt_kernel import kt_kernel_ext
 
+
+def _k_total(ki, expert_num: int) -> int:
+    """이 티어가 소유하는 총 K 행 수. 밴드형이면 E*rows, 인덱스형이면 row_off[-1]."""
+    return int(ki.row_off[-1]) if len(ki.row_off) else expert_num * int(ki.rows)
+
 # cpu_cold 커널 키 → ext 클래스. (키의 유효성 검증은 sglang prism kernels.py,
 # 실제 클래스 선택은 여기 — 라이브러리가 자기 클래스 목록을 소유한다)
 _PARTIAL_MOE_CLASSES = {
@@ -80,17 +85,20 @@ class PartialMoEWrapper:
         if self._moe is not None:
             raise RuntimeError("weights already loaded")
         cfg = self._config
+        # 원소 수로 검증한다 (shape가 아니라): 밴드형은 [E, N, rows]지만
+        # 인덱스형은 expert 블록 [N, k(e)]를 이어 붙인 flat이라 rank가 다르다.
+        # 두 경우 모두 "N × Σₑ k(e)"라는 하나의 불변식으로 덮인다.
         expect = {
-            "gate": (cfg.expert_num, cfg.intermediate_size, cfg.partial.gateup.rows),
-            "up": (cfg.expert_num, cfg.intermediate_size, cfg.partial.gateup.rows),
-            "down": (cfg.expert_num, cfg.hidden_size, cfg.partial.down.rows),
+            "gate": cfg.intermediate_size * _k_total(cfg.partial.gate, cfg.expert_num),
+            "up": cfg.intermediate_size * _k_total(cfg.partial.up, cfg.expert_num),
+            "down": cfg.hidden_size * _k_total(cfg.partial.down, cfg.expert_num),
         }
         for name, t, shape in (
             ("gate", gate_proj, expect["gate"]),
             ("up", up_proj, expect["up"]),
             ("down", down_proj, expect["down"]),
         ):
-            if (t.dtype != torch.bfloat16 or tuple(t.shape) != shape
+            if (t.dtype != torch.bfloat16 or t.numel() != shape
                     or not t.is_contiguous() or t.device.type != "cpu"):
                 # device 검증 필수: CUDA 텐서의 data_ptr()는 device 주소라
                 # C++ host memcpy가 그대로 segfault한다 (조용한 죽음 방지)
@@ -119,10 +127,10 @@ class PartialMoEWrapper:
 
     # (키, 축 종류, 나눔) — 축 "grid"는 밴드와 무관한 threshold 곡선이다.
     _SPARSITY_KEYS = (
-        ("gate_wn_sq", "gateup", 1),
-        ("gate_pair_dot", "gateup", 2),
-        ("up_wn_sq", "gateup", 1),
-        ("up_pair_dot", "gateup", 2),
+        ("gate_wn_sq", "gate", 1),
+        ("gate_pair_dot", "gate", 2),
+        ("up_wn_sq", "up", 1),
+        ("up_pair_dot", "up", 2),
         ("down_wn_sq", "down", 1),
         ("down_pair_dot", "down", 2),
         ("thr_gate", "grid", 1),
@@ -141,13 +149,17 @@ class PartialMoEWrapper:
                 f"config.partial.sparsity grid not set (ng={sp.ng}, grid={sp.grid}) "
                 f"— 예산은 테이블 설치 전에 채워져야 한다"
             )
-        rows = {"gateup": cfg.partial.gateup.rows, "down": cfg.partial.down.rows,
-                "grid": sp.ng}
+        # 점수 테이블도 weight와 같은 인덱스로 잘려 들어오므로 총 행 수가 기준
+        # 이다 (밴드형이면 E*rows와 같다). threshold 곡선만 축이 다르다.
+        rows = {"gate": _k_total(cfg.partial.gate, cfg.expert_num),
+                "up": _k_total(cfg.partial.up, cfg.expert_num),
+                "down": _k_total(cfg.partial.down, cfg.expert_num),
+                "grid": cfg.expert_num * sp.ng}
         kept = {}
         for name, band, div in self._SPARSITY_KEYS:
             t = tables[name]
-            want = (cfg.expert_num, rows[band] // div)
-            if (t.dtype != torch.float32 or tuple(t.shape) != want
+            want = rows[band] // div
+            if (t.dtype != torch.float32 or t.numel() != want
                     or not t.is_contiguous() or t.device.type != "cpu"):
                 raise ValueError(
                     f"{name} must be contiguous CPU fp32 {want}, got "

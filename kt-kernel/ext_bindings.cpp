@@ -859,7 +859,8 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   py::class_<PartialGeometry>(moe_module, "PartialGeometry")
       .def(py::init<>())
       .def_readwrite("enabled", &PartialGeometry::enabled)
-      .def_readwrite("gateup", &PartialGeometry::gateup)
+      .def_readwrite("gate", &PartialGeometry::gate)
+      .def_readwrite("up", &PartialGeometry::up)
       .def_readwrite("down", &PartialGeometry::down)
       .def_readwrite("n_total", &PartialGeometry::n_total)
       // K2: NUMA N-shard 테이블 (Plan 주입; 비면 균등 분할)
@@ -900,6 +901,8 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       // Prism partial (K-split tier) geometry — 계약: sglang prism CONTRACTS.md ②
       // (KRange/PartialGeometry 클래스 바인딩은 MOEConfig 바인딩 직전에 등록)
       .def_readwrite("partial", &GeneralMOEConfig::partial)
+      // gate와 up의 기하가 달라 activation을 두 번 pack해야 하는가 (K5).
+      .def("dual_pack", &GeneralMOEConfig::dual_pack)
 
       .def_readonly("num_gpu_experts", &GeneralMOEConfig::num_gpu_experts)
       .def_property(
