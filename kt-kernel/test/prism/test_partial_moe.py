@@ -948,3 +948,106 @@ def test_shared_geometry_does_not_dual_pack(cpuinfer):
     cfg.partial.up.row_off = up_off.tolist()
     cfg.partial.up.idx = up_idx.tolist()
     assert cfg.dual_pack()
+
+
+# ── 타일 경계 패딩 ─────────────────────────────────────────────────────────
+#
+# plan/자산이 지키는 정렬은 페어(%2)뿐인데 packed 저장은 K_STEP(32)의 배수를
+# 요구한다. 로더가 올림하고 0 행을 채우며, kt는 real_rows로 실제 행 수를 안다.
+
+def test_padded_rows_are_numerically_harmless(cpuinfer):
+    """k_real이 타일 배수가 아니어도 결과는 실제 행만 쓴 것과 같다.
+
+    패딩 행의 weight가 0이라 dense 경로에서 곱이 0이다 — 인덱스가 아무 열을
+    가리켜도 무해하다는 것이 이 설계의 전제이고, 여기서 그것을 고정한다.
+    """
+    torch.manual_seed(6)
+    real = [96, 66, 34, 128, 98, 64, 30, 96]          # 전부 %2, 대부분 %32 아님
+    pad = [(r + K_STEP - 1) // K_STEP * K_STEP for r in real]
+    assert pad != real                                  # 실제로 패딩이 있는 구성
+
+    gate_full = int_gen((expert_num, intermediate_size, hidden_size))
+    up_full = int_gen((expert_num, intermediate_size, hidden_size))
+    down_full = int_gen((expert_num, hidden_size, intermediate_size))
+    g = torch.Generator().manual_seed(21)
+    row_off, idx, real_cols, acc = [0], [], [], 0
+    for e in range(expert_num):
+        cols = torch.randperm(hidden_size, generator=g)[: real[e]]
+        real_cols.append(cols)
+        # 패딩 열은 아무 값이나 가리켜도 된다 (weight가 0) — 0으로 채운다.
+        idx.append(torch.cat([cols, torch.zeros(pad[e] - real[e], dtype=torch.long)]))
+        acc += pad[e]
+        row_off.append(acc)
+    row_off = torch.tensor(row_off, dtype=torch.int32)
+    idx_flat = torch.cat(idx)
+
+    def flat_padded(full):
+        blocks = []
+        for e in range(expert_num):
+            blk = torch.zeros(intermediate_size if full is not down_full else hidden_size,
+                              pad[e], dtype=torch.bfloat16)
+            blk[:, : real[e]] = full[e][:, real_cols[e]]   # 나머지는 0 (패딩)
+            blocks.append(blk.contiguous().reshape(-1))
+        return torch.cat(blocks).contiguous()
+
+    dn_off, dn_idx = make_index([DOWN_K_ROWS] * expert_num, intermediate_size, 31)
+
+    def flat_down():
+        blocks = []
+        for e in range(expert_num):
+            cols = dn_idx[dn_off[e] : dn_off[e + 1]].to(torch.int64)
+            blocks.append(down_full[e][:, cols].contiguous().reshape(-1))
+        return torch.cat(blocks).contiguous()
+
+    gate_flat, up_flat, down_flat = flat_padded(gate_full), flat_padded(up_full), flat_down()
+
+    cfg = kt_kernel_ext.moe.MOEConfig(
+        expert_num, num_experts_per_tok, hidden_size, intermediate_size, 0)
+    cfg.max_len = max_len
+    cfg.partial.enabled = True
+    for side in (cfg.partial.gate, cfg.partial.up):
+        side.row_off = row_off.tolist()
+        side.idx = idx_flat.to(torch.int32).tolist()
+        side.real_rows = real
+    cfg.partial.down.row_off = dn_off.tolist()
+    cfg.partial.down.idx = dn_idx.tolist()
+    cfg.partial.n_total = intermediate_size
+    cfg.gate_proj, cfg.up_proj, cfg.down_proj = (
+        gate_flat.data_ptr(), up_flat.data_ptr(), down_flat.data_ptr())
+    cfg.gate_scale = cfg.up_scale = cfg.down_scale = 0
+    cfg.pool = cpuinfer.backend_
+    moe = kt_kernel_ext.moe.AMXBF16_MOE(cfg)
+    phys = torch.arange(expert_num, dtype=torch.int64).contiguous()
+    cpuinfer.submit(moe.load_weights_task(phys.data_ptr()))
+    cpuinfer.sync()
+
+    x = int_gen((4, hidden_size)).contiguous()
+    ids = make_routing(4)
+    out = run_gateup(moe, ids, x)
+    ref = torch.empty(4, num_experts_per_tok, 2 * intermediate_size)
+    for m in range(4):
+        for j in range(num_experts_per_tok):
+            e = int(ids[m, j])
+            cols = real_cols[e]
+            ref[m, j, :intermediate_size] = x[m, cols].float() @ gate_full[e][:, cols].float().t()
+            ref[m, j, intermediate_size:] = x[m, cols].float() @ up_full[e][:, cols].float().t()
+    assert torch.equal(out.float(), ref)
+
+
+def test_real_rows_beyond_one_tile_rejected(cpuinfer):
+    """real_rows는 패딩 전 값이므로 padded와 한 타일 이내로 붙어 있어야 한다.
+    (더 벌어졌다면 로더가 올림을 잘못한 것이고, 조용히 행을 버리게 된다.)"""
+    off, idx = make_index([64] * expert_num, hidden_size, 0)
+    cfg = kt_kernel_ext.moe.MOEConfig(
+        expert_num, num_experts_per_tok, hidden_size, intermediate_size, 0)
+    cfg.max_len = max_len
+    cfg.partial.enabled = True
+    for side in (cfg.partial.gate, cfg.partial.up):
+        side.row_off = off.tolist()
+        side.idx = idx.tolist()
+        side.real_rows = [16] * expert_num          # 64와 두 타일 차이
+    cfg.partial.down.offset, cfg.partial.down.rows = DOWN_K_OFFSET, DOWN_K_ROWS
+    cfg.partial.n_total = intermediate_size
+    cfg.pool = cpuinfer.backend_
+    with pytest.raises(RuntimeError, match="real_rows"):
+        kt_kernel_ext.moe.AMXBF16_MOE(cfg)

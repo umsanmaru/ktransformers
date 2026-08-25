@@ -303,6 +303,53 @@ ceil32(k_real[e])`로 올림한다. 버퍼 기계에는 `k_pad`를 넘겨 `asser
 새 CPU 커널이 ragged k를 네이티브로 다루면 저장 올림 자체가 불필요하다 —
 그래서 sglang 계약에는 32가 적혀 있지 않다.
 
+### 10.7 알려진 결함 — partial + GPU writeback (미지원, 가드로 막음)
+
+`write_weights_to_buffer`(bf16-moe.hpp)는 packed BufferB를 GPU 버퍼로 되풀어
+쓰는 경로다. 오프셋 산식이 `get_submat`을 **손으로 복제**해 놓았고 그 복제본이
+full 치수를 전제한다:
+
+```
+cpu_k_w13 = config.hidden_size            ← 밴드 K가 아니다 (gate_k(e)/up_k(e))
+global_n_offset_w13 = tp_part_idx * cpu_n ← Plan 주입 불균등 shard가 아니다
+cpu_k_w2  = config.intermediate_size      ← down_k(e)가 아니다
+                                          ← 그리고 gate와 up이 같은 K를 쓴다
+```
+
+partial에서는 셋 다 깨질 수 있고(가변 per-expert K, 불균등 N shard, gate ≠ up),
+깨지면 **throw 없이 GPU 버퍼에 쓰레기가 간다**.
+
+현재 prism 경로는 이 함수를 호출하지 않는다 — `PartialMoEWrapper`에 writeback
+진입점이 없고 sglang 쪽 참조도 0건이다. 그래서 잠재 결함이며, fused `forward`를
+거부하는 것과 같은 형태의 런타임 가드로 막아 두었다.
+
+**제대로 고치는 방법은 접근자 치환이 아니라 중복 제거다.** 다섯 줄을
+`gate_k(e)` 등으로 바꾸면 지금은 맞지만, 이 함수가 packed 주소식을 복제하고
+있다는 사실은 그대로다 — B 레이아웃이 바뀌면 또 갈라진다. `bb->get_submat(bb->n,
+bb->k, ...)`로 바꾸면 치수를 버퍼 자신에서 가져오므로 밴드/per-expert K와
+어긋나는 것이 **구조적으로 불가능**해지고, 레이아웃 변경도 자동으로 따라온다.
+레이아웃 가정이 남는 곳은 `unpack_nk_block_bf16`의 16×16 transpose 한 군데뿐이고,
+그건 커널이 `unpack_tile`을 제공하는 형태가 맞다.
+
+### 10.8 타일 경계 패딩 (as-built)
+
+plan/자산이 지키는 정렬은 페어(%2)뿐인데 packed 저장은 `K_STEP`의 배수를
+요구한다. 로더가 `k_real(e)`를 타일 경계까지 올리고 그만큼 **0 행**을 weight에
+채우며, `KIndex.real_rows`가 실제 행 수를 나른다:
+
+- **dense 경로**는 0을 곱하므로 패딩 인덱스가 아무 열을 가리켜도 무해하다.
+- **sparse 경로**는 `build_pair_mask`가 `k_real/2` 이상의 비트를 끈다. calib을
+  0으로 패딩해 자연히 떨어지길 기대하면 안 된다 — `thr == 0`일 때 `imp = 0 >= 0`
+  이 참이라 비트가 서고 쓸모없는 B 로드가 생긴다.
+- `real_rows`가 비면 패딩 없음(`k_real == k`)이다. 검증은 "짝수이고 padded와 한
+  타일 이내"까지 본다 — 더 벌어졌다면 로더가 올림을 잘못한 것이고 행이 조용히
+  버려진다.
+
+`build_pair_mask`는 이 작업에서 **절대 k 기준**으로 다시 썼다 (페어 `p = k/2`,
+워드 `p/16`, 비트 `p%16`). 이전 판이 `T::K_STEP`으로 격자를 유도한 것은 수치적
+으로 같았지만 커널 타입을 마스크 정의에 새게 했다 — 마스크는 VNNI 짝짓기가
+하드웨어로 고정하는 **절대 k의 성질**이라 어떤 B packing에도 영향받지 않는다.
+
 ### 10.5 바뀌지 않는 것
 
 - **진입점 시그니처 전부.** 계약 ②-3("K축 기하는 호출에 없다")이 이 전환에서

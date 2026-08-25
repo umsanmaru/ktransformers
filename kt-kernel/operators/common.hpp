@@ -260,10 +260,20 @@ struct KIndex {
   int rows = 0;
   std::vector<int32_t> row_off;   // [E+1]
   std::vector<uint16_t> idx;      // [row_off.back()]
+  // [E] — 패딩 전의 실제 행 수. 비어 있으면 패딩이 없다는 뜻(k(e)와 같다).
+  //
+  // plan/자산이 지켜야 하는 정렬은 페어(%2)뿐인데(sglang 계약 ①) packed 저장은
+  // 커널 타일(K_STEP)의 배수를 요구하므로, 로더가 k_real(e)를 타일 경계까지
+  // 올리고 그 만큼의 **0 행**을 weight에 채워 넣는다. dense 경로는 0을 곱해
+  // 무해하지만, sparse 경로는 tail 비트를 명시적으로 꺼야 한다 — thr == 0이면
+  // imp = 0 >= 0이 참이라 비트가 서고 쓸모없는 B 로드가 생긴다.
+  std::vector<int32_t> real_rows;
 
   inline bool indexed() const { return !row_off.empty(); }
 
   inline int k(int e) const { return indexed() ? row_off[e + 1] - row_off[e] : rows; }
+
+  inline int k_real(int e) const { return real_rows.empty() ? k(e) : real_rows[e]; }
 
   inline int64_t row_base(int e) const {
     return indexed() ? (int64_t)row_off[e] : (int64_t)e * rows;
@@ -284,7 +294,8 @@ struct KIndex {
   }
 
   inline bool same_as(const KIndex& o) const {
-    return offset == o.offset && rows == o.rows && row_off == o.row_off && idx == o.idx;
+    return offset == o.offset && rows == o.rows && row_off == o.row_off && idx == o.idx &&
+           real_rows == o.real_rows;
   }
 };
 
@@ -466,6 +477,12 @@ struct GeneralMOEConfig {
   inline int gate_k(int e) const { return partial.enabled ? partial.gate.k(e) : hidden_size; }
   inline int up_k(int e) const { return partial.enabled ? partial.up.k(e) : hidden_size; }
   inline int down_k(int e) const { return partial.enabled ? partial.down.k(e) : intermediate_size; }
+  // 패딩 전의 실제 행 수 — sparse 마스크의 tail을 끄는 데만 쓰인다.
+  inline int gate_k_real(int e) const { return partial.enabled ? partial.gate.k_real(e) : hidden_size; }
+  inline int up_k_real(int e) const { return partial.enabled ? partial.up.k_real(e) : hidden_size; }
+  inline int down_k_real(int e) const {
+    return partial.enabled ? partial.down.k_real(e) : intermediate_size;
+  }
   // 풀 산정용 최악치. gate/up 풀은 하나를 나눠 쓰므로 둘의 최대다.
   inline int gateup_k_max() const {
     return partial.enabled ? std::max(partial.gate.k_max(), partial.up.k_max()) : hidden_size;

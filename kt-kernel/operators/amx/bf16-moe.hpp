@@ -337,6 +337,26 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
                                const std::vector<uintptr_t>& w2_weight_ptrs,
                                [[maybe_unused]] const std::vector<uintptr_t>& w2_scale_ptrs) const {
     auto& config = config_;
+    // Prism partial 인스턴스는 GPU writeback을 지원하지 않는다 (fused forward를
+    // 거부하는 것과 같은 이유·같은 형태의 가드다).
+    //
+    // 아래 오프셋 산식이 full 치수를 전제로 손으로 펼쳐져 있다: cpu_k_w13은
+    // hidden_size(밴드 K가 아님), global_n_offset은 tp_part_idx * cpu_n(불균등
+    // shard가 아님), 그리고 gate와 up이 같은 K를 쓴다 — partial에서는 셋 다
+    // 깨질 수 있고(가변 per-expert K, Plan 주입 불균등 테이블, gate != up),
+    // 깨지면 throw 없이 GPU 버퍼에 쓰레기가 간다.
+    //
+    // 지금 prism 경로는 이 함수를 호출하지 않는다 (PartialMoEWrapper에
+    // writeback 진입점이 없다) — 잠재 결함이라 막아만 둔다. 제대로 고치는
+    // 방법은 접근자 치환이 아니라 **중복 제거**다: 이 함수가 get_submat의
+    // 주소식을 손으로 복제한 것이 문제의 뿌리이므로, bb->get_submat(bb->n,
+    // bb->k, ...)로 바꾸면 밴드/per-expert K와 어긋나는 것이 구조적으로
+    // 불가능해지고 B 레이아웃 변경도 자동으로 따라온다 (doc §10.7).
+    if (config.is_partial()) {
+      throw std::runtime_error(
+          "AMX_BF16_MOE_TP::write_weights_to_buffer called on a Prism partial instance "
+          "(GPU writeback assumes full K and uniform N shards; see doc/prism-partial-entrypoints.md 10.7)");
+    }
     auto pool = config.pool->get_subpool(tp_part_idx);
 
     constexpr int N_STEP = T::N_STEP;

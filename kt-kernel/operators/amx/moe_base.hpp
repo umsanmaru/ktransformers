@@ -344,6 +344,21 @@ class AMX_MOE_BASE {
         throw std::runtime_error(std::string("partial: ") + what + " index out of axis range");
       }
     }
+    if (!ki.real_rows.empty()) {
+      if (ki.real_rows.size() + 1 != ki.row_off.size()) {
+        throw std::runtime_error(std::string("partial: ") + what + " real_rows size != E");
+      }
+      for (size_t e = 0; e < ki.real_rows.size(); ++e) {
+        const int kr = ki.row_off[e + 1] - ki.row_off[e];
+        // 패딩은 타일 경계까지의 올림이므로 [kr - K_STEP, kr] 안에 있어야 하고,
+        // 페어 단위여야 한다 (마스크 tail이 페어 경계에서 끊기므로).
+        if (ki.real_rows[e] <= 0 || ki.real_rows[e] > kr || ki.real_rows[e] % 2 != 0 ||
+            kr - ki.real_rows[e] >= T::K_STEP) {
+          throw std::runtime_error(std::string("partial: ") + what +
+                                   " real_rows must be an even count within one tile of the padded rows");
+        }
+      }
+    }
   }
 
   // **항상 dst에 쓴다.** prefill은 토큰마다 자기 슬롯에 담아야 하므로 퇴화형
@@ -384,15 +399,30 @@ class AMX_MOE_BASE {
   // 테이블이 음이 아닌 분포의 분위수) 판정이 동일하고, 밴드당 928회의
   // sqrt가 사라진다. thr==0이면 e>=0이 항상 참이라 전량 통과 — GPU 측
   // (imp>=0)과 같은 결론이다.
-  static void build_pair_mask(const ggml_bf16_t* src, int k_rows, const float* a_sq, const float* c, float thr,
-                              uint16_t* out) {
-    constexpr int PAIRS_PER_TILE = T::K_STEP / 2;
+  //
+  // 마스크는 **절대 k의 성질**이다: 페어 p = k/2가 워드 p/16의 비트 p%16이고,
+  // 이 대응은 어떤 B packing에도 영향받지 않는다 (VNNI 짝짓기가 (짝수 k, 홀수
+  // k)로 하드웨어가 고정하므로). 이전 판이 `T::K_STEP`으로 이 격자를 유도한
+  // 것은 수치적으로 같았지만 커널 타입을 마스크 정의에 새게 했다 —
+  // n-contig B 레이아웃 도입 검토에서 드러난 누수라 여기서 끊는다.
+  //
+  // k_real < k_rows이면 그 차이는 타일 경계까지 올린 **패딩 행**이다. 해당
+  // 페어의 비트는 끈다: weight가 0이라 수치에는 영향이 없지만, thr == 0일 때
+  // 비트가 서면 쓸모없는 B 로드가 생긴다.
+  static constexpr int PAIRS_PER_WORD = 16;
+  static void build_pair_mask(const ggml_bf16_t* src, int k_rows, int k_real, const float* a_sq, const float* c,
+                              float thr, uint16_t* out) {
     const float thr2 = thr * thr;
-    const int tiles = k_rows / T::K_STEP;
-    for (int t = 0; t < tiles; t++) {
+    const int pairs = k_rows / 2;
+    const int pairs_real = k_real / 2;
+    const int words = pairs / PAIRS_PER_WORD;
+    for (int t = 0; t < words; t++) {
       uint16_t bits = 0;
-      const int base = t * PAIRS_PER_TILE;
-      for (int j = 0; j < PAIRS_PER_TILE; j++) {
+      const int base = t * PAIRS_PER_WORD;
+      for (int j = 0; j < PAIRS_PER_WORD; j++) {
+        if (base + j >= pairs_real) {
+          break;  // 패딩 페어 — 비트를 끈 채로 둔다
+        }
         const int p = base + j;
         const float x0 = GGML_BF16_TO_FP32(src[2 * p]);
         const float x1 = GGML_BF16_TO_FP32(src[2 * p + 1]);
@@ -493,9 +523,9 @@ class AMX_MOE_BASE {
       const size_t u_off = (size_t)config_.up_row_base(e);
       const ggml_bf16_t* xg = rows_of(config_.partial.gate, e, x_full);
       const ggml_bf16_t* xu = config_.dual_pack() ? m_local_input_up_ptr_[e] : xg;
-      build_pair_mask(xg, config_.gate_k(e), g_a + g_off, g_c + g_off / 2,
+      build_pair_mask(xg, config_.gate_k(e), config_.gate_k_real(e), g_a + g_off, g_c + g_off / 2,
                       thr_of(g_t, e, sp.ng, sp.grid, s_gate[j]), m_pair_mask_gate_[e].data());
-      build_pair_mask(xu, config_.up_k(e), u_a + u_off, u_c + u_off / 2,
+      build_pair_mask(xu, config_.up_k(e), config_.up_k_real(e), u_a + u_off, u_c + u_off / 2,
                       thr_of(u_t, e, sp.ng, sp.grid, s_up[j]), m_pair_mask_up_[e].data());
     }
     m_sparse_active_ = true;
@@ -524,7 +554,7 @@ class AMX_MOE_BASE {
       const int rows = config_.down_k(e);
       const size_t off = (size_t)config_.down_row_base(e);
       const ggml_bf16_t* src = rows_of(config_.partial.down, e, act + (size_t)j * act_row);
-      build_pair_mask(src, rows, d_a + off, d_c + off / 2,
+      build_pair_mask(src, rows, config_.down_k_real(e), d_a + off, d_c + off / 2,
                       thr_of(d_t, e, sp.ng, sp.grid, s_down[j]), m_pair_mask_down_[e].data());
     }
     m_sparse_active_ = true;

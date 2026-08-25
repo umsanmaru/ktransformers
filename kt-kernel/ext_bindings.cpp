@@ -829,6 +829,8 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def_readwrite("rows", &KIndex::rows)
       .def_readwrite("row_off", &KIndex::row_off)
       .def_readwrite("idx", &KIndex::idx)
+      .def_readwrite("real_rows", &KIndex::real_rows)
+      .def("k_real", &KIndex::k_real, py::arg("expert"))
       .def("indexed", &KIndex::indexed)
       .def("k", &KIndex::k, py::arg("expert"))
       .def("k_max", &KIndex::k_max);
