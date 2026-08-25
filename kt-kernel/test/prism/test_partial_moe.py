@@ -676,3 +676,204 @@ def test_sparse_rejects_weights_without_tables():
     x = randn_gen((1, hidden_size)).contiguous()
     with pytest.raises(RuntimeError, match="sparsity.enabled is false"):
         run_gateup(dense, ids, x, router_weights(1))
+
+
+# ── 인덱스 기하 (sglang CONTRACTS.md ① 2026-08-25) ──────────────────────────
+#
+# 티어 멤버십이 밴드에서 **가변 per-expert 인덱스**로 바뀐 경로. 밴드는 이
+# 표현의 퇴화형이므로 위 테스트들이 그 등가성을 계속 지키고, 여기서는 밴드로는
+# 표현 불가능한 것 — expert마다 다른 행 수, 무작위 순열 — 을 검증한다.
+
+K_STEP = 32  # packed 저장의 타일 단위 (expert별 행 수는 이 배수여야 한다)
+
+
+def make_index(rows_per_expert, axis_len, seed, shuffle=True):
+    """(row_off, idx) — expert별 가변 길이 + (선택) 무작위 순열."""
+    g = torch.Generator().manual_seed(seed)
+    row_off, idx, acc = [0], [], 0
+    for kr in rows_per_expert:
+        cols = torch.randperm(axis_len, generator=g)[:kr] if shuffle else torch.arange(kr)
+        idx.append(cols)
+        acc += kr
+        row_off.append(acc)
+    return (torch.tensor(row_off, dtype=torch.int32),
+            torch.cat(idx).to(torch.int32))
+
+
+def build_indexed_moe(gu_rows, dn_rows, cpuinfer, gen=randn_gen, seed=0, shuffle=True):
+    """인덱스형 partial 인스턴스 + 레퍼런스용 (full weight, index) 반환.
+
+    주입 weight는 expert 블록 [N, k(e)]를 이어 붙인 flat이다 — 열 r이 원본
+    K열 idx_e[r]에 대응한다 (로더가 그렇게 잘라 넣는 것과 같은 형태).
+    """
+    gate_full = gen((expert_num, intermediate_size, hidden_size))
+    up_full = gen((expert_num, intermediate_size, hidden_size))
+    down_full = gen((expert_num, hidden_size, intermediate_size))
+    gu_off, gu_idx = make_index(gu_rows, hidden_size, seed, shuffle)
+    dn_off, dn_idx = make_index(dn_rows, intermediate_size, seed + 1, shuffle)
+
+    def flat(full, off, idx):
+        blocks = []
+        for e in range(expert_num):
+            cols = idx[off[e] : off[e + 1]].to(torch.int64)
+            blocks.append(full[e][:, cols].contiguous().reshape(-1))
+        return torch.cat(blocks).contiguous()
+
+    gate_flat, up_flat = flat(gate_full, gu_off, gu_idx), flat(up_full, gu_off, gu_idx)
+    down_flat = flat(down_full, dn_off, dn_idx)
+
+    config = kt_kernel_ext.moe.MOEConfig(
+        expert_num, num_experts_per_tok, hidden_size, intermediate_size, 0
+    )
+    config.max_len = max_len
+    config.partial.enabled = True
+    config.partial.gateup.row_off = gu_off.tolist()
+    config.partial.gateup.idx = gu_idx.tolist()
+    config.partial.down.row_off = dn_off.tolist()
+    config.partial.down.idx = dn_idx.tolist()
+    config.partial.n_total = intermediate_size
+    config.gate_proj = gate_flat.data_ptr()
+    config.up_proj = up_flat.data_ptr()
+    config.down_proj = down_flat.data_ptr()
+    config.gate_scale = config.up_scale = config.down_scale = 0
+    config.pool = cpuinfer.backend_
+
+    moe = kt_kernel_ext.moe.AMXBF16_MOE(config)
+    phys_map = torch.arange(expert_num, dtype=torch.int64).contiguous()
+    cpuinfer.submit(moe.load_weights_task(phys_map.data_ptr()))
+    cpuinfer.sync()
+    # flat 텐서는 pack 완료까지 살아 있어야 한다 (수명 규칙) — 호출자가 잡는다.
+    keep = (gate_flat, up_flat, down_flat)
+    return moe, gate_full, up_full, down_full, (gu_off, gu_idx), (dn_off, dn_idx), keep
+
+
+def gateup_reference_indexed(x, expert_ids, gate_full, up_full, gu):
+    off, idx = gu
+    out = torch.empty(x.shape[0], num_experts_per_tok, 2 * intermediate_size)
+    for m in range(x.shape[0]):
+        for j in range(num_experts_per_tok):
+            e = int(expert_ids[m, j])
+            cols = idx[off[e] : off[e + 1]].to(torch.int64)
+            xs = x[m, cols].float()
+            out[m, j, :intermediate_size] = xs @ gate_full[e][:, cols].float().t()
+            out[m, j, intermediate_size:] = xs @ up_full[e][:, cols].float().t()
+    return out
+
+
+def down_reference_indexed(act, expert_ids, down_full, dn):
+    off, idx = dn
+    out = torch.empty(act.shape[0], num_experts_per_tok, hidden_size)
+    for m in range(act.shape[0]):
+        for j in range(num_experts_per_tok):
+            e = int(expert_ids[m, j])
+            cols = idx[off[e] : off[e + 1]].to(torch.int64)
+            out[m, j] = act[m, j, cols].float() @ down_full[e][:, cols].float().t()
+    return out
+
+
+VARIABLE_GU = [64, 192, 32, 128, 96, 224, 32, 160]   # expert별 행 수 (K_STEP 배수)
+VARIABLE_DN = [32, 96, 64, 128, 32, 64, 96, 32]
+
+
+@pytest.fixture(scope="module")
+def cpuinfer():
+    return kt_kernel_ext.CPUInfer(CPUINFER_PARAM)
+
+
+@pytest.mark.parametrize("qlen", QLENS)
+def test_indexed_gateup_matches_reference(cpuinfer, qlen):
+    """가변 k[e] + 셔플 인덱스 — 밴드로는 표현 불가능한 구성."""
+    torch.manual_seed(0)
+    moe, g, u, d, gu, dn, _keep = build_indexed_moe(VARIABLE_GU, VARIABLE_DN, cpuinfer)
+    x = randn_gen((qlen, hidden_size)).contiguous()
+    ids = make_routing(qlen)
+    out = run_gateup(moe, ids, x)
+    ref = gateup_reference_indexed(x, ids, g, u, gu)
+    assert rel_diff(out, ref) < 0.02
+
+
+@pytest.mark.parametrize("qlen", QLENS)
+def test_indexed_gateup_bitexact_on_integer_inputs(cpuinfer, qlen):
+    """정수 입력에서 비트일치 — 좌표 뒤섞임의 exact 검출기 (계약 ⑤-5).
+
+    밴드에서는 이 테스트가 순서를 검증하지 못한다(어느 순서로 더해도 같은 행).
+    셔플 인덱스에서 비로소 검출기가 된다.
+    """
+    torch.manual_seed(1)
+    moe, g, u, d, gu, dn, _keep = build_indexed_moe(
+        VARIABLE_GU, VARIABLE_DN, cpuinfer, gen=int_gen, seed=7)
+    x = int_gen((qlen, hidden_size)).contiguous()
+    ids = make_routing(qlen)
+    out = run_gateup(moe, ids, x)
+    ref = gateup_reference_indexed(x, ids, g, u, gu)
+    assert torch.equal(out.float(), ref)
+
+
+@pytest.mark.parametrize("qlen", QLENS)
+def test_indexed_down_bitexact_on_integer_inputs(cpuinfer, qlen):
+    torch.manual_seed(2)
+    moe, g, u, d, gu, dn, _keep = build_indexed_moe(
+        VARIABLE_GU, VARIABLE_DN, cpuinfer, gen=int_gen, seed=11)
+    act = int_gen((qlen, num_experts_per_tok, intermediate_size)).contiguous()
+    ids = make_routing(qlen)
+    out = run_down(moe, ids, act)
+    ref = down_reference_indexed(act, ids, d, dn)
+    assert torch.equal(out.float(), ref)
+
+
+def test_indexed_contiguous_matches_band(cpuinfer):
+    """연속 인덱스(shuffle=False, 균일 길이)는 밴드 경로와 **비트일치**.
+
+    전환기의 합격 기준 — 밴드가 인덱스의 퇴화형이라는 주장의 실행형이다.
+    """
+    torch.manual_seed(3)
+    rows_gu = [GATEUP_K_ROWS] * expert_num
+    rows_dn = [DOWN_K_ROWS] * expert_num
+    moe_i, g, u, d, gu, dn, _keep = build_indexed_moe(
+        rows_gu, rows_dn, cpuinfer, gen=int_gen, seed=5, shuffle=False)
+    # 밴드 인스턴스: 같은 full weight의 [0, rows) 구간 (shuffle=False가 만든 것과 동일)
+    gate_cold = g[:, :, :GATEUP_K_ROWS].contiguous()
+    up_cold = u[:, :, :GATEUP_K_ROWS].contiguous()
+    down_cold = d[:, :, :DOWN_K_ROWS].contiguous()
+    cfg = kt_kernel_ext.moe.MOEConfig(
+        expert_num, num_experts_per_tok, hidden_size, intermediate_size, 0)
+    cfg.max_len = max_len
+    cfg.partial.enabled = True
+    cfg.partial.gateup.offset, cfg.partial.gateup.rows = 0, GATEUP_K_ROWS
+    cfg.partial.down.offset, cfg.partial.down.rows = 0, DOWN_K_ROWS
+    cfg.partial.n_total = intermediate_size
+    cfg.gate_proj, cfg.up_proj, cfg.down_proj = (
+        gate_cold.data_ptr(), up_cold.data_ptr(), down_cold.data_ptr())
+    cfg.gate_scale = cfg.up_scale = cfg.down_scale = 0
+    cfg.pool = cpuinfer.backend_
+    moe_b = kt_kernel_ext.moe.AMXBF16_MOE(cfg)
+    phys = torch.arange(expert_num, dtype=torch.int64).contiguous()
+    cpuinfer.submit(moe_b.load_weights_task(phys.data_ptr()))
+    cpuinfer.sync()
+    x = int_gen((4, hidden_size)).contiguous()
+    ids = make_routing(4)
+    assert torch.equal(run_gateup(moe_i, ids, x), run_gateup(moe_b, ids, x))
+
+
+def test_indexed_rejects_unaligned_rows(cpuinfer):
+    """expert별 행 수는 packed 타일(K_STEP)의 배수여야 한다 — 아니면 즉사."""
+    with pytest.raises(RuntimeError, match="multiple of K_STEP"):
+        build_indexed_moe([64, 48] + [64] * (expert_num - 2), VARIABLE_DN, cpuinfer)
+
+
+def test_indexed_rejects_out_of_range(cpuinfer):
+    """인덱스가 축 밖을 가리키면 즉사 (조용히 남의 열을 읽지 않는다)."""
+    off, idx = make_index([64] * expert_num, hidden_size, 0)
+    idx[3] = hidden_size + 1
+    config = kt_kernel_ext.moe.MOEConfig(
+        expert_num, num_experts_per_tok, hidden_size, intermediate_size, 0)
+    config.max_len = max_len
+    config.partial.enabled = True
+    config.partial.gateup.row_off = off.tolist()
+    config.partial.gateup.idx = idx.tolist()
+    config.partial.down.offset = DOWN_K_OFFSET
+    config.partial.down.rows = DOWN_K_ROWS
+    config.partial.n_total = intermediate_size
+    config.pool = cpuinfer.backend_
+    with pytest.raises(RuntimeError, match="index out of axis range"):
+        kt_kernel_ext.moe.AMXBF16_MOE(config)

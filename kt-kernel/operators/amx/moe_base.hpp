@@ -119,15 +119,11 @@ class AMX_MOE_BASE {
     // enabled면 모든 값이 명시여야 하고, 노드 shard는 TP ctor가 채운 상태다.
     if (config_.is_partial()) {
       const auto& pg = config_.partial;
-      if (pg.gateup.rows <= 0 || pg.down.rows <= 0 || pg.n_total <= 0) {
-        throw std::runtime_error("partial: enabled but gateup/down/n_total not explicit");
+      if (pg.n_total <= 0) {
+        throw std::runtime_error("partial: enabled but n_total not explicit");
       }
-      if (pg.gateup.offset < 0 || pg.gateup.offset + pg.gateup.rows > config_.hidden_size) {
-        throw std::runtime_error("partial: gateup K band out of hidden range");
-      }
-      if (pg.down.offset < 0 || pg.down.offset + pg.down.rows > pg.n_total) {
-        throw std::runtime_error("partial: down K band out of intermediate range");
-      }
+      validate_kindex(pg.gateup, config_.hidden_size, "gateup");
+      validate_kindex(pg.down, pg.n_total, "down");
       if (pg.gateup_n.rows != config_.intermediate_size) {
         throw std::runtime_error("partial: node gateup_n.rows != node intermediate_size");
       }
@@ -157,11 +153,15 @@ class AMX_MOE_BASE {
       if (config_.num_experts_per_tok > kMaxTopK) {
         throw std::runtime_error("prism sparsity: num_experts_per_tok exceeds kMaxTopK");
       }
-      const int gu_tiles = config_.gateup_k() / T::K_STEP;
-      const int dn_tiles = config_.down_k() / T::K_STEP;
-      m_pair_mask_gate_.assign(config_.expert_num, std::vector<uint16_t>(gu_tiles, 0));
-      m_pair_mask_up_.assign(config_.expert_num, std::vector<uint16_t>(gu_tiles, 0));
-      m_pair_mask_down_.assign(config_.expert_num, std::vector<uint16_t>(dn_tiles, 0));
+      // 타일 수는 expert별이다 (k(e)/K_STEP). 균일 plan에서는 전부 같은 값.
+      m_pair_mask_gate_.resize(config_.expert_num);
+      m_pair_mask_up_.resize(config_.expert_num);
+      m_pair_mask_down_.resize(config_.expert_num);
+      for (int e = 0; e < config_.expert_num; e++) {
+        m_pair_mask_gate_[e].assign(config_.gateup_k(e) / T::K_STEP, 0);
+        m_pair_mask_up_[e].assign(config_.gateup_k(e) / T::K_STEP, 0);
+        m_pair_mask_down_[e].assign(config_.down_k(e) / T::K_STEP, 0);
+      }
     }
     m_local_input_ptr_.resize(config_.expert_num);
     m_local_gate_output_ptr_.resize(config_.expert_num);
@@ -172,31 +172,32 @@ class AMX_MOE_BASE {
     // 기하 필드가 0(기본)이면 full 치수를 돌려주므로 기존 동작과 동일.
     // (gate/up의 K = gateup_k(), down의 K = down_k(); N 축은 불변)
     for (size_t i = 0; i < config_.expert_num; i++) {
-      gate_up_ba_.push_back(make_buffer_a(config_.max_len, config_.gateup_k(), nullptr));
+      gate_up_ba_.push_back(make_buffer_a(config_.max_len, config_.gateup_k(i), nullptr));
       gate_bc_.push_back(make_buffer_c(config_.max_len, config_.intermediate_size, nullptr));
       up_bc_.push_back(make_buffer_c(config_.max_len, config_.intermediate_size, nullptr));
-      down_ba_.push_back(make_buffer_a(config_.max_len, config_.down_k(), nullptr));
+      down_ba_.push_back(make_buffer_a(config_.max_len, config_.down_k(i), nullptr));
       down_bc_.push_back(make_buffer_c(config_.max_len, config_.down_n(), nullptr));
 
       void* gate_bb_ptr =
-          std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.gateup_k()));
-      gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.gateup_k(), gate_bb_ptr));
+          std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.gateup_k(i)));
+      gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.gateup_k(i), gate_bb_ptr));
 
-      void* up_bb_ptr = std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.gateup_k()));
-      up_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.gateup_k(), up_bb_ptr));
+      void* up_bb_ptr =
+          std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.gateup_k(i)));
+      up_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.gateup_k(i), up_bb_ptr));
 
-      void* down_bb_ptr =
-          std::aligned_alloc(64, buffer_b_required_size(config_.down_n(), config_.down_k()));
-      down_bb_.push_back(make_buffer_b(config_.down_n(), config_.down_k(), down_bb_ptr));
+      void* down_bb_ptr = std::aligned_alloc(64, buffer_b_required_size(config_.down_n(), config_.down_k(i)));
+      down_bb_.push_back(make_buffer_b(config_.down_n(), config_.down_k(i), down_bb_ptr));
     }
     // TODO: need update to all *.hpp
     // (config_.expert_num * T::M_STEP) in pool_count_ is to ensure padding for each experts.
     pool_count_ = (size_t)config_.max_len * config_.num_experts_per_tok + config_.expert_num * T::M_STEP;
 
-    gate_up_ba_pool_bytes_ = buffer_a_required_size(pool_count_, config_.gateup_k()) + pool_count_ * 64;
+    // 풀은 전 expert가 공유하므로 최악치로 잡는다 (가변 K에서 유일한 안전값).
+    gate_up_ba_pool_bytes_ = buffer_a_required_size(pool_count_, config_.gateup_k_max()) + pool_count_ * 64;
     gate_bc_pool_bytes_ = buffer_c_required_size(pool_count_, config_.intermediate_size) + pool_count_ * 64;
     up_bc_pool_bytes_ = buffer_c_required_size(pool_count_, config_.intermediate_size) + pool_count_ * 64;
-    down_ba_pool_bytes_ = buffer_a_required_size(pool_count_, config_.down_k()) + pool_count_ * 64;
+    down_ba_pool_bytes_ = buffer_a_required_size(pool_count_, config_.down_k_max()) + pool_count_ * 64;
     down_bc_pool_bytes_ = buffer_c_required_size(pool_count_, config_.down_n()) + pool_count_ * 64;
 
     mem_requests.append_pointer(&gate_up_ba_pool_, gate_up_ba_pool_bytes_);
@@ -256,14 +257,15 @@ class AMX_MOE_BASE {
   void forward_gateup_partial(int qlen, int k, const int64_t* expert_ids, const void* input, void* out,
                               const float* weights = nullptr) {
     if (qlen == 1) {
-      // full-width 입력에서 자기 밴드의 시작 — 단일 행이라 row stride 무관
-      const ggml_bf16_t* x_band = (const ggml_bf16_t*)input + config_.partial.gateup.offset;
+      // full-width 입력을 그대로 넘긴다 — 어느 열을 읽을지는 인스턴스에
+      // 구워진 기하가 안다 (계약 ②-3). 단일 행이라 row stride 무관.
+      const ggml_bf16_t* x_full = (const ggml_bf16_t*)input;
       int activated_expert = prepare_gateup_routing(k, expert_ids);
       if (activated_expert == 0) {
         return;
       }
-      carve_and_pack_gateup(activated_expert, qlen, x_band);
-      build_gateup_masks(k, expert_ids, x_band, weights);
+      carve_and_pack_gateup(activated_expert, qlen, x_full);
+      build_gateup_masks(k, expert_ids, x_full, weights);
       run_gateup_stage(activated_expert, qlen);
       m_sparse_active_ = false;
       export_gateup_partial(qlen, k, expert_ids, (ggml_bf16_t*)out);
@@ -282,6 +284,80 @@ class AMX_MOE_BASE {
   }
 
  private:
+  // ── K 인덱스 (sglang CONTRACTS.md ① 2026-08-25) ────────────────────────
+  //
+  // 티어 멤버십이 밴드에서 **가변 per-expert 인덱스**로 바뀌면서 이 인스턴스가
+  // 하는 일 하나가 늘었다: pack 직전에 activation을 인덱스로 모아 dense를
+  // 만든다. 그 뒤 코드(from_mat, 마스크 빌더, GEMM)는 dense만 보므로 무변경이다
+  // — packed B의 행 순서가 곧 gather된 순서라 마스크 비트 ↔ 타일 대응이
+  // 그대로 유지된다.
+  //
+  // 퇴화형(연속 밴드)은 gather를 건너뛰고 포인터만 넘긴다. 밴드 plan에서
+  // 비트 동일 동작이 유지되는 것이 이 분기의 존재 이유다.
+
+  static void validate_kindex(const KIndex& ki, int axis_len, const char* what) {
+    if (!ki.indexed()) {
+      if (ki.rows <= 0) {
+        throw std::runtime_error(std::string("partial: ") + what + " rows not explicit");
+      }
+      if (ki.offset < 0 || ki.offset + ki.rows > axis_len) {
+        throw std::runtime_error(std::string("partial: ") + what + " K band out of range");
+      }
+      return;
+    }
+    if (ki.idx.size() != (size_t)ki.row_off.back()) {
+      throw std::runtime_error(std::string("partial: ") + what + " idx length != row_off.back()");
+    }
+    for (size_t e = 0; e + 1 < ki.row_off.size(); ++e) {
+      const int kr = ki.row_off[e + 1] - ki.row_off[e];
+      if (kr < 0) {
+        throw std::runtime_error(std::string("partial: ") + what + " row_off not monotone");
+      }
+      // packed 저장이 타일 단위라 각 expert의 행 수가 K_STEP의 배수여야 한다.
+      // plan 쪽 정렬 요구는 페어(%2)뿐이고, 여기까지 올림하는 것은 로더의 몫이다.
+      if (kr % T::K_STEP != 0) {
+        throw std::runtime_error(std::string("partial: ") + what +
+                                 " per-expert rows must be a multiple of K_STEP");
+      }
+    }
+    for (uint16_t v : ki.idx) {
+      if ((int)v >= axis_len) {
+        throw std::runtime_error(std::string("partial: ") + what + " index out of axis range");
+      }
+    }
+  }
+
+  // **항상 dst에 쓴다.** prefill은 토큰마다 자기 슬롯에 담아야 하므로 퇴화형
+  // 에서도 복사가 필요하다 (여기서 zero-copy를 하면 prefill이 조용히 빈
+  // 버퍼를 pack한다 — 실제로 한 번 그렇게 틀렸다).
+  void gather_rows(const KIndex& ki, int64_t e, const ggml_bf16_t* row, ggml_bf16_t* dst) const {
+    const int kr = ki.k((int)e);
+    if (!ki.indexed()) {
+      std::memcpy(dst, row + ki.offset, (size_t)kr * sizeof(ggml_bf16_t));
+      return;
+    }
+    const uint16_t* idx = ki.index_of((int)e);
+    for (int r = 0; r < kr; r++) {
+      dst[r] = row[idx[r]];
+    }
+  }
+
+  // decode용: dense를 가리키는 포인터를 얻는다. 퇴화형이면 복사 없이
+  // 원본을 가리키므로 밴드 경로의 비용이 그대로 0이다.
+  const ggml_bf16_t* dense_rows(const KIndex& ki, int64_t e, const ggml_bf16_t* row,
+                                ggml_bf16_t* scratch) const {
+    if (!ki.indexed()) {
+      return row + ki.offset;
+    }
+    gather_rows(ki, e, row, scratch);
+    return scratch;
+  }
+
+  // gather가 이미 끝난 뒤 같은 dense를 다시 가리킨다 (마스크 빌더용).
+  const ggml_bf16_t* rows_of(const KIndex& ki, int64_t e, const ggml_bf16_t* row) const {
+    return ki.indexed() ? m_local_input_ptr_[e] : row + ki.offset;
+  }
+
   // ── k2wl2 페어 마스크 (계약 ①) ────────────────────────────────────────
   // imp_j = sqrt(max(a[2j]·x0² + a[2j+1]·x1² + 2·c[j]·x0·x1, 0)) >= thr
   //
@@ -367,14 +443,13 @@ class AMX_MOE_BASE {
   // slot별 (expert, proj) 마스크를 채운다. 포인터 유효성은 호출 스레드
   // (TP_MOE::forward_*_partial)가 이미 검증했다 — worker 안의 throw는
   // uncaught → std::terminate이므로 여기서는 던지지 않는다.
-  void build_gateup_masks(int k, const int64_t* expert_ids, const ggml_bf16_t* x_band,
+  void build_gateup_masks(int k, const int64_t* expert_ids, const ggml_bf16_t* x_full,
                           const float* weights) {
     const auto& sp = config_.partial.sparsity;
     if (!sp.enabled || weights == nullptr) {
       m_sparse_active_ = false;
       return;
     }
-    const int rows = config_.gateup_k();
     const float* g_a = (const float*)sp.gate_wn_sq;
     const float* g_c = (const float*)sp.gate_pair_dot;
     const float* u_a = (const float*)sp.up_wn_sq;
@@ -391,11 +466,15 @@ class AMX_MOE_BASE {
       if (config_.should_skip_expert(e)) {
         continue;
       }
-      const size_t off = (size_t)e * (size_t)rows;
+      // 점수 테이블도 weight와 같은 인덱스로 gather되어 들어오므로, expert
+      // 오프셋은 행 기준 row_base다 (균일 밴드에서는 e*rows와 같다).
+      const int rows = config_.gateup_k(e);
+      const size_t off = (size_t)config_.gateup_row_base(e);
       const size_t poff = off / 2;
-      build_pair_mask(x_band, rows, g_a + off, g_c + poff,
+      const ggml_bf16_t* xe = rows_of(config_.partial.gateup, e, x_full);
+      build_pair_mask(xe, rows, g_a + off, g_c + poff,
                       thr_of(g_t, e, sp.ng, sp.grid, s_gate[j]), m_pair_mask_gate_[e].data());
-      build_pair_mask(x_band, rows, u_a + off, u_c + poff,
+      build_pair_mask(xe, rows, u_a + off, u_c + poff,
                       thr_of(u_t, e, sp.ng, sp.grid, s_up[j]), m_pair_mask_up_[e].data());
     }
     m_sparse_active_ = true;
@@ -408,7 +487,6 @@ class AMX_MOE_BASE {
       m_sparse_active_ = false;
       return;
     }
-    const int rows = config_.down_k();
     const float* d_a = (const float*)sp.down_wn_sq;
     const float* d_c = (const float*)sp.down_pair_dot;
     const float* d_t = (const float*)sp.thr_down;
@@ -422,8 +500,9 @@ class AMX_MOE_BASE {
       if (config_.should_skip_expert(e)) {
         continue;
       }
-      const ggml_bf16_t* src = act + (size_t)j * act_row + config_.partial.down.offset;
-      const size_t off = (size_t)e * (size_t)rows;
+      const int rows = config_.down_k(e);
+      const size_t off = (size_t)config_.down_row_base(e);
+      const ggml_bf16_t* src = rows_of(config_.partial.down, e, act + (size_t)j * act_row);
       build_pair_mask(src, rows, d_a + off, d_c + off / 2,
                       thr_of(d_t, e, sp.ng, sp.grid, s_down[j]), m_pair_mask_down_[e].data());
     }
@@ -456,12 +535,16 @@ class AMX_MOE_BASE {
 
   // 풀 carving + x pack: 활성 expert에만 gate_bc/up_bc/gate_up_ba 구간을
   // 배정하고 (forward_decode 2단계의 gateup 부분집합), 밴드 x를 pack한다.
-  void carve_and_pack_gateup(int activated_expert, int qlen, const ggml_bf16_t* x_band) {
+  void carve_and_pack_gateup(int activated_expert, int qlen, const ggml_bf16_t* x_full) {
     constexpr size_t M_STEP = T::M_STEP;
     auto align64 = [](size_t v) { return (v + 63) & (~(size_t)63); };
     void* gate_bc_pool_ptr = gate_bc_pool_;
     void* up_bc_pool_ptr = up_bc_pool_;
     void* gate_up_ba_pool_ptr = gate_up_ba_pool_;
+    // gather 목적지 커서 (인덱스형에서만 쓰인다). decode의 gateup phase에서
+    // m_local_input_에 다른 소비자가 없어 prefill 버퍼를 그대로 재사용한다 —
+    // 신규 할당 0.
+    ggml_bf16_t* gather_cursor = m_local_input_;
     for (int i = 0; i < activated_expert; i++) {
       auto expert_idx = m_expert_id_map_[i];
       size_t max_m = (qlen + M_STEP - 1) / M_STEP * M_STEP;
@@ -478,9 +561,12 @@ class AMX_MOE_BASE {
 
       gate_up_ba_[expert_idx]->max_m = max_m;
       gate_up_ba_[expert_idx]->set_data(gate_up_ba_pool_ptr);
-      gate_up_ba_pool_ptr =
-          (void*)((uintptr_t)gate_up_ba_pool_ptr + align64(buffer_a_required_size(max_m, config_.gateup_k())));
-      gate_up_ba_[expert_idx]->from_mat(qlen, const_cast<ggml_bf16_t*>(x_band), 0, 1);
+      gate_up_ba_pool_ptr = (void*)((uintptr_t)gate_up_ba_pool_ptr +
+                                    align64(buffer_a_required_size(max_m, config_.gateup_k(expert_idx))));
+      m_local_input_ptr_[expert_idx] = gather_cursor;
+      const ggml_bf16_t* a = dense_rows(config_.partial.gateup, expert_idx, x_full, gather_cursor);
+      gather_cursor += config_.gateup_k(expert_idx);
+      gate_up_ba_[expert_idx]->from_mat(qlen, const_cast<ggml_bf16_t*>(a), 0, 1);
     }
   }
 
@@ -538,10 +624,12 @@ class AMX_MOE_BASE {
     void* gate_up_ba_pool_ptr = gate_up_ba_pool_;
     void* gate_bc_pool_ptr = gate_bc_pool_;
     void* up_bc_pool_ptr = up_bc_pool_;
-    size_t offset = 0;
+    size_t offset = 0, input_cursor = 0;
     size_t used_pool_m = 0, used_pool_bytes_a = 0, used_pool_bytes_bc_gate = 0, used_pool_bytes_bc_up = 0;
     for (int i = 0; i < config_.expert_num; i++) {
-      m_local_input_ptr_[i] = m_local_input_ + offset * config_.gateup_k();
+      // 행 폭이 expert마다 다르므로 offset×폭이 아니라 누적 커서다.
+      m_local_input_ptr_[i] = m_local_input_ + input_cursor;
+      input_cursor += (size_t)m_local_num_[i] * config_.gateup_k(i);
       m_local_gate_output_ptr_[i] = m_local_gate_output_ + offset * config_.intermediate_size;
       m_local_up_output_ptr_[i] = m_local_up_output_ + offset * config_.intermediate_size;
       offset += m_local_num_[i];
@@ -551,7 +639,7 @@ class AMX_MOE_BASE {
       size_t max_m = (m_local_num_[i] + M_STEP - 1) / M_STEP * M_STEP;
       gate_up_ba_[i]->max_m = max_m;
       gate_up_ba_[i]->set_data(gate_up_ba_pool_ptr);
-      size_t ba_size = align64(buffer_a_required_size(max_m, config_.gateup_k()));
+      size_t ba_size = align64(buffer_a_required_size(max_m, config_.gateup_k(i)));
       gate_up_ba_pool_ptr = (void*)((uintptr_t)gate_up_ba_pool_ptr + ba_size);
 
       gate_bc_[i]->max_m = max_m;
@@ -589,15 +677,15 @@ class AMX_MOE_BASE {
         pool->do_work_stealing_job(count, nullptr, fn, nullptr);
       }
     };
-    const size_t band = (size_t)config_.gateup_k();
-    const size_t band_off = (size_t)config_.partial.gateup.offset;
     direct_or_pool(qlen, [&](int i) {
       for (int j = 0; j < k; j++) {
-        if (config_.should_skip_expert(expert_ids[i * k + j])) {
+        const int64_t e = expert_ids[i * k + j];
+        if (config_.should_skip_expert(e)) {
           continue;
         }
-        std::memcpy(m_local_input_ptr_[expert_ids[i * k + j]] + (size_t)m_local_pos_[i][j] * band,
-                    x + (size_t)i * config_.hidden_size + band_off, band * sizeof(ggml_bf16_t));
+        const size_t band = (size_t)config_.gateup_k(e);
+        gather_rows(config_.partial.gateup, e, x + (size_t)i * config_.hidden_size,
+                    m_local_input_ptr_[e] + (size_t)m_local_pos_[i][j] * band);
       }
     });
     direct_or_pool(activated_expert, [this](int task_id) {
@@ -698,6 +786,7 @@ class AMX_MOE_BASE {
     auto align64 = [](size_t v) { return (v + 63) & (~(size_t)63); };
     void* down_ba_pool_ptr = down_ba_pool_;
     void* down_bc_pool_ptr = down_bc_pool_;
+    ggml_bf16_t* gather_cursor = m_local_input_;       // 인덱스형 gather 목적지
     const size_t act_row = (size_t)config_.n_total();  // act의 slot 행 stride
     for (int j = 0; j < k; j++) {
       int64_t e = expert_ids[j];
@@ -708,15 +797,18 @@ class AMX_MOE_BASE {
 
       down_ba_[e]->max_m = max_m;
       down_ba_[e]->set_data(down_ba_pool_ptr);
-      down_ba_pool_ptr =
-          (void*)((uintptr_t)down_ba_pool_ptr + align64(buffer_a_required_size(max_m, config_.down_k())));
+      down_ba_pool_ptr = (void*)((uintptr_t)down_ba_pool_ptr +
+                                 align64(buffer_a_required_size(max_m, config_.down_k(e))));
 
       down_bc_[e]->max_m = max_m;
       down_bc_[e]->set_data(down_bc_pool_ptr);
       down_bc_pool_ptr =
           (void*)((uintptr_t)down_bc_pool_ptr + align64(buffer_c_required_size(max_m, config_.down_n())));
 
-      const ggml_bf16_t* src = act + (size_t)j * act_row + config_.partial.down.offset;
+      m_local_input_ptr_[e] = gather_cursor;
+      const ggml_bf16_t* src =
+          dense_rows(config_.partial.down, e, act + (size_t)j * act_row, gather_cursor);
+      gather_cursor += config_.down_k(e);
       down_ba_[e]->from_mat(qlen, const_cast<ggml_bf16_t*>(src), 0, 1);
     }
   }
@@ -743,10 +835,11 @@ class AMX_MOE_BASE {
     auto align64 = [](size_t v) { return (v + 63) & (~(size_t)63); };
     void* down_ba_pool_ptr = down_ba_pool_;
     void* down_bc_pool_ptr = down_bc_pool_;
-    size_t offset = 0;
+    size_t offset = 0, input_cursor = 0;
     size_t used_pool_m = 0, used_pool_bytes_ba_down = 0, used_pool_bytes_bc_down = 0;
     for (int i = 0; i < config_.expert_num; i++) {
-      m_local_input_ptr_[i] = m_local_input_ + offset * config_.down_k();
+      m_local_input_ptr_[i] = m_local_input_ + input_cursor;
+      input_cursor += (size_t)m_local_num_[i] * config_.down_k(i);
       m_local_down_output_ptr_[i] = m_local_down_output_ + offset * config_.down_n();
       offset += m_local_num_[i];
       if (m_local_num_[i] == 0) {
@@ -755,7 +848,7 @@ class AMX_MOE_BASE {
       size_t max_m = (m_local_num_[i] + M_STEP - 1) / M_STEP * M_STEP;
       down_ba_[i]->max_m = max_m;
       down_ba_[i]->set_data(down_ba_pool_ptr);
-      size_t ba_size = align64(buffer_a_required_size(max_m, config_.down_k()));
+      size_t ba_size = align64(buffer_a_required_size(max_m, config_.down_k(i)));
       down_ba_pool_ptr = (void*)((uintptr_t)down_ba_pool_ptr + ba_size);
 
       down_bc_[i]->max_m = max_m;
@@ -787,16 +880,16 @@ class AMX_MOE_BASE {
         pool->do_work_stealing_job(count, nullptr, fn, nullptr);
       }
     };
-    const size_t band = (size_t)config_.down_k();
-    const size_t band_off = (size_t)config_.partial.down.offset;
     const size_t act_row = (size_t)config_.n_total();
     direct_or_pool(qlen, [&](int i) {
       for (int j = 0; j < k; j++) {
-        if (config_.should_skip_expert(expert_ids[i * k + j])) {
+        const int64_t e = expert_ids[i * k + j];
+        if (config_.should_skip_expert(e)) {
           continue;
         }
-        std::memcpy(m_local_input_ptr_[expert_ids[i * k + j]] + (size_t)m_local_pos_[i][j] * band,
-                    act + ((size_t)i * k + j) * act_row + band_off, band * sizeof(ggml_bf16_t));
+        const size_t band = (size_t)config_.down_k(e);
+        gather_rows(config_.partial.down, e, act + ((size_t)i * k + j) * act_row,
+                    m_local_input_ptr_[e] + (size_t)m_local_pos_[i][j] * band);
       }
     });
     direct_or_pool(activated_expert, [this](int task_id) {

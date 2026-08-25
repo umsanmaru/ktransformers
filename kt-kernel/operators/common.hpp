@@ -10,12 +10,15 @@
 #include <arm_sve.h>
 #endif
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <type_traits>
+#include <vector>
 
 // #define FORWARD_TIME_PROFILE
 // #define FORWARD_TIME_REPORT
@@ -231,16 +234,60 @@ struct QuantConfig {
 // 함께 다니는 값들을 구조로 묶는다 — GeneralMOEConfig의 평평한 필드 사이에
 // 섞이지 않도록 config.partial.* 네임스페이스를 형성.
 
-// contraction 축의 연속 밴드 [offset, offset + rows)
+// contraction 축의 연속 밴드 [offset, offset + rows) — N shard 전용
 struct KRange {
   int offset = 0;
   int rows = 0;
 };
 
+// contraction 축에서 이 티어가 소유하는 행 (sglang CONTRACTS.md ① 2026-08-25).
+// 모드는 정확히 둘이다:
+//
+//  - **퇴화형** (`row_off` 비었음): 전 expert 공통 연속 밴드
+//    [offset, offset + rows). 밴드 시절과 비트 동일 경로이고, gather도 하지
+//    않는다 (포인터 산술만).
+//  - **인덱스형**: `row_off`[E+1]이 expert별 구간을, `idx`가 원본 K행 번호를
+//    준다. 길이가 expert마다 달라도 되고 순서도 임의다. 둘은 **항상 짝**으로
+//    온다 — 연속인 인덱스도 idx를 싣는다(2 B/행). 모드를 셋으로 늘려
+//    "row_off는 있고 idx는 없는" 경우를 만들면 gather 경로가 갈라지는데,
+//    그 절약(행당 2 B)이 분기 하나만 못하다.
+//
+// `row_base`는 weight 주입 오프셋이기도 하다: expert e의 블록은 ckpt 방향
+// [N, k(e)]이므로 시작 원소가 N * row_base(e)다. 하나의 테이블이 인덱스와
+// 스토어를 함께 서비스한다 (계약 ③).
+struct KIndex {
+  int offset = 0;
+  int rows = 0;
+  std::vector<int32_t> row_off;   // [E+1]
+  std::vector<uint16_t> idx;      // [row_off.back()]
+
+  inline bool indexed() const { return !row_off.empty(); }
+
+  inline int k(int e) const { return indexed() ? row_off[e + 1] - row_off[e] : rows; }
+
+  inline int64_t row_base(int e) const {
+    return indexed() ? (int64_t)row_off[e] : (int64_t)e * rows;
+  }
+
+  inline const uint16_t* index_of(int e) const {
+    return indexed() ? idx.data() + row_off[e] : nullptr;
+  }
+
+  // 버퍼 산정용 최악치. 풀은 전 expert가 공유하므로 max로 잡아야 한다.
+  inline int k_max() const {
+    if (!indexed()) return rows;
+    int m = 0;
+    for (size_t e = 0; e + 1 < row_off.size(); ++e) {
+      m = std::max(m, row_off[e + 1] - row_off[e]);
+    }
+    return m;
+  }
+};
+
 struct PartialGeometry {
   bool enabled = false;
-  KRange gateup;  // gate/up 공유 (2026-08-20 확정: 두 행렬은 K·N 분할을 공유) — hidden 축
-  KRange down;    // intermediate 축, global 좌표. full이면 {0, intermediate_size} 명시
+  KIndex gateup;  // gate/up 공유 — hidden 축 (독립화는 dual-pack과 함께, K5)
+  KIndex down;    // intermediate 축, global 좌표. full이면 {0, intermediate_size} 명시
   int n_total = 0;  // gate/up 출력축(intermediate)의 full 크기
 
   // ── K2: NUMA N-shard — 전 proj가 각자의 출력축(N)으로 노드 분할 ──────
@@ -405,10 +452,21 @@ struct GeneralMOEConfig {
   PartialGeometry partial;
 
   inline bool is_partial() const { return partial.enabled; }
-  // gate/up의 contraction 축(hidden) 밴드 크기
-  inline int gateup_k() const { return partial.enabled ? partial.gateup.rows : hidden_size; }
-  // down의 contraction 축(intermediate, global 좌표) 밴드 크기
-  inline int down_k() const { return partial.enabled ? partial.down.rows : intermediate_size; }
+  // gate/up의 contraction 축(hidden) 행 수 — **expert별**.
+  // 무인자 판을 남기지 않은 것은 의도다: 가변 K에서 "이 자리가 per-expert인가
+  // 최악치인가"를 컴파일러가 강제로 묻게 한다 (틀리면 조용한 오답이다).
+  inline int gateup_k(int e) const { return partial.enabled ? partial.gateup.k(e) : hidden_size; }
+  inline int gateup_k_max() const { return partial.enabled ? partial.gateup.k_max() : hidden_size; }
+  // down의 contraction 축(intermediate, global 좌표) 행 수
+  inline int down_k(int e) const { return partial.enabled ? partial.down.k(e) : intermediate_size; }
+  inline int down_k_max() const { return partial.enabled ? partial.down.k_max() : intermediate_size; }
+  // 주입 weight에서 expert e 블록의 시작 행 (열 수는 호출부가 곱한다)
+  inline int64_t gateup_row_base(int e) const {
+    return partial.enabled ? partial.gateup.row_base(e) : (int64_t)e * hidden_size;
+  }
+  inline int64_t down_row_base(int e) const {
+    return partial.enabled ? partial.down.row_base(e) : (int64_t)e * intermediate_size;
+  }
   // gate/up 출력축(intermediate)의 full 크기 — TP 분할 후 노드 config의
   // intermediate_size는 shard가 되므로 full-width out 열 쓰기에 필요
   inline int n_total() const { return partial.enabled ? partial.n_total : intermediate_size; }

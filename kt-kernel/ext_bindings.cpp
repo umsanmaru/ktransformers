@@ -821,6 +821,17 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def(py::init<>())
       .def_readwrite("offset", &KRange::offset)
       .def_readwrite("rows", &KRange::rows);
+  // 티어가 소유하는 K 행. row_off를 비워두면 (offset, rows) 퇴화형 =
+  // 밴드 시절과 동일 경로. 채우면 expert별 가변 길이 + 임의 순열.
+  py::class_<KIndex>(moe_module, "KIndex")
+      .def(py::init<>())
+      .def_readwrite("offset", &KIndex::offset)
+      .def_readwrite("rows", &KIndex::rows)
+      .def_readwrite("row_off", &KIndex::row_off)
+      .def_readwrite("idx", &KIndex::idx)
+      .def("indexed", &KIndex::indexed)
+      .def("k", &KIndex::k, py::arg("expert"))
+      .def("k_max", &KIndex::k_max);
   // Prism 입력기반 sparsity: 점수 재료 포인터 (weight와 같은 수명)
   py::class_<PartialGeometry::SparsityGeometry>(moe_module, "SparsityGeometry")
       .def(py::init<>())

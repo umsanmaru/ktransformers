@@ -206,7 +206,7 @@ sglang CONTRACTS.md ①③④⑤의 같은 날 개정에 대응하는 kt 쪽 작
 커밋 단위는 sglang 쪽 계획의 K3/K4/K5에 대응한다. **②는 시그니처 불변**이라
 진입점 커밋이 따로 없다 — `PartialGeometry`의 내용물만 바뀐다.
 
-### 10.1 KIndex + per-expert 접근자 (K3)
+### 10.1 KIndex + per-expert 접근자 (K3) — **as-built 2026-08-25**
 
 ```cpp
 struct KIndex {
@@ -235,7 +235,7 @@ PartialGeometry { bool enabled; KIndex gate, up, down; int n_total; ... }
 `wn_sq`/`pair_dot`은 K축이므로 **weight와 같은 인덱스로 gather된 것**이 주입된다
 (로드 타임). `thr_*` 곡선은 `[E, ng]`라 인덱스와 무관하므로 그대로다.
 
-### 10.2 gather-to-dense (K4)
+### 10.2 gather-to-dense (K4) — **as-built 2026-08-25**
 
 pack 직전에 activation을 인덱스로 모아 dense를 만들고, **그 뒤 코드는 무변경**
 으로 그 dense를 읽는다 (planir `PackLhsCold`와 같은 형태). 마스크 코드가 손대지
@@ -250,8 +250,33 @@ pack 직전에 activation을 인덱스로 모아 dense를 만들고, **그 뒤 �
 | `moe_base.hpp:778` `gather_and_pack_down_prefill` | 동형 |
 | `moe_base.hpp:370,404` `build_*_masks` | 인자를 gather된 dense로 (`x_band` → 스크래치) |
 
-`contiguous == true`면 gather를 건너뛰고 포인터를 그대로 넘긴다 — 기존 밴드
-plan과의 비트일치가 전환기의 검증 기준이다.
+#### as-built 노트
+
+- **모드는 둘로 고정했다**: `row_off`가 비면 퇴화형(전 expert 공통 밴드),
+  채우면 인덱스형이고 이때 `idx`는 **항상 함께 온다**. "row_off는 있고 idx는
+  없는" 세 번째 모드(연속·가변)를 두면 gather 경로가 갈라지는데, 그 절약이
+  행당 2 B라 분기 하나만 못하다.
+- **무인자 접근자를 남기지 않았다.** `gateup_k()` → `gateup_k(e)` /
+  `gateup_k_max()`로 갈라, "이 자리가 per-expert인가 최악치인가"를 컴파일러가
+  전 호출부에서 강제로 묻게 했다 (틀리면 조용한 오답이다). 실제로 44곳이
+  걸렸고 분류는 기계적이었다: 풀 크기만 `_max`, 나머지는 전부 per-expert.
+- **gather와 dense를 분리해야 했다.** 처음엔 한 함수가 "dense 포인터를
+  돌려준다(퇴화형이면 zero-copy)"를 겸했는데, prefill은 토큰마다 **자기
+  슬롯에 반드시 써야** 하므로 퇴화형에서도 복사가 필요하다. 겸하게 두었더니
+  prefill이 조용히 빈 버퍼를 pack했다 (테스트 7개가 잡았다). 지금은
+  `gather_rows`(항상 dst에 쓴다) / `dense_rows`(decode용, 퇴화형 zero-copy)다.
+- **gather 목적지는 `m_local_input_`을 재사용한다** — decode의 gateup phase
+  에서 이 버퍼에 다른 소비자가 없어 prefill 버퍼를 그대로 쓴다. 신규 할당 0.
+  마스크 빌더도 같은 버퍼를 읽으므로(`rows_of`) 비트 ↔ 타일 대응이 유지된다.
+- **점수 테이블 오프셋**은 `e * rows`에서 `row_base(e)`로 바뀌었다.
+  `pair_dot`은 그 절반이고, 모든 `k(e)`가 K_STEP(32)의 배수라 짝수가 보장된다.
+- **TP staging**(bf16-moe.hpp의 노드별 weight 복사)도 per-expert 원소 수로
+  바뀌었다. 총량은 `row_base(E)`, expert 시작은 `row_base(e)`다.
+- 검증은 init에서: `row_off` 단조, `idx` 길이 정합, **expert별 행 수가 K_STEP
+  배수**, 인덱스가 축 범위 안. 마지막 둘은 조용한 오답의 원천이라 즉사시킨다.
+
+`contiguous`(연속 인덱스)면 gather 커널이 아니라 memcpy로 떨어지고, 퇴화형이면
+아예 포인터만 넘긴다 — 기존 밴드 plan과의 비트일치가 전환기의 검증 기준이다.
 
 ### 10.3 dual-pack (K5)
 
@@ -290,7 +315,11 @@ ceil32(k_real[e])`로 올림한다. 버퍼 기계에는 `k_pad`를 넘겨 `asser
 
 ### 10.6 검증
 
-- 연속 인덱스(`contiguous == true`)에서 기존 밴드 경로와 **비트일치**.
+- 연속 인덱스(균일 길이 + shuffle 없음)에서 기존 밴드 경로와 **비트일치**
+  (as-built: `test_indexed_contiguous_matches_band`).
 - 셔플 인덱스 + expert마다 다른 `k[e]`에서 **정수 비트일치** (정확 표현 가능한
   작은 정수 입력 — 계약 ⑤-5). 좌표 뒤섞임의 유일한 exact 검출기다.
+  as-built: `test_indexed_{gateup,down}_bitexact_on_integer_inputs`, decode·
+  prefill 파라미터화. 밴드에서는 이 테스트가 순서를 검증하지 못한다 — 어느
+  순서로 더해도 같은 행이기 때문이고, 셔플에서 비로소 검출기가 된다.
 - gate ≠ up 조합, `k[e] == 0`인 expert가 섞인 구성, 불균등 NUMA shard × prefill.
