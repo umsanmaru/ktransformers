@@ -110,6 +110,21 @@ class AMX_MOE_BASE {
   void* down_bc_pool_ = nullptr;
 
   GeneralMOEConfig config_;
+  // config_.dual_pack()의 값을 생성 시점에 한 번 굳힌 것.
+  //
+  // 그 메서드는 플래그 조회처럼 보이지만 gate와 up의 KIndex를 **전수 비교**
+  // 한다 (`same_as` → `std::vector<uint16_t>` operator==). 인덱스가 Σₑ k[e]개라
+  // E=128·k=1792이면 호출당 458 KB를 양쪽 읽고, 흔한 경우가 "같다"라서 조기
+  // 종료도 없다 — 빠른 경로가 가장 비싼 경로다. 그런데 호출부가 활성 expert
+  // 루프와 GEMM 태스크 안에 있어(층당 A회 이상 × 40층 × 스텝마다) 단일 스레드
+  // memcmp 대역폭이 그대로 벽시계에 드러났다 (E=128에서 실측 gather 델타의
+  // 상당분).
+  //
+  // 값은 로드 후 안 바뀌는 기하 속성이므로 스텝마다 답이 달라질 수 없다.
+  // 지연 memoize(mutable 캐시) 대신 생성자에서 굳히는 이유는 워커 스레드들이
+  // 동시에 읽기 때문이다 — 값이 늘 같아 실害는 없어도 형식상 레이스이고,
+  // 단일 스레드 지점에서 미리 계산하면 그 문제가 아예 없다.
+  bool dual_pack_ = false;
   using input_t = ggml_bf16_t;
   using output_t = float;
   static constexpr double ELEMENT_SIZE = T::ELEMENT_SIZE;
@@ -157,13 +172,16 @@ class AMX_MOE_BASE {
       }
     }
 
+    // 아래 버퍼 산정이 이미 이 값을 쓰므로 여기서 굳혀야 한다.
+    dual_pack_ = config_.dual_pack();
+
     MemoryRequest mem_requests;
     const size_t ml = config_.max_len;
     const size_t k_tok = config_.num_experts_per_tok;
     const size_t H = config_.hidden_size;
     const size_t I = config_.intermediate_size;
     mem_requests.append_pointer(&m_local_input_, sizeof(ggml_bf16_t) * k_tok * ml * H);
-    if (config_.dual_pack()) {
+    if (dual_pack_) {
       mem_requests.append_pointer(&m_local_input_up_, sizeof(ggml_bf16_t) * k_tok * ml * H);
     }
     mem_requests.append_pointer(&m_local_gate_output_, sizeof(ggml_bf16_t) * k_tok * ml * I);
@@ -217,7 +235,7 @@ class AMX_MOE_BASE {
     // (gate/up의 K = gateup_k(), down의 K = down_k(); N 축은 불변)
     for (size_t i = 0; i < config_.expert_num; i++) {
       gate_up_ba_.push_back(make_buffer_a(config_.max_len, config_.gate_k(i), nullptr));
-      if (config_.dual_pack()) {
+      if (dual_pack_) {
         up_ba_.push_back(make_buffer_a(config_.max_len, config_.up_k(i), nullptr));
       }
       gate_bc_.push_back(make_buffer_c(config_.max_len, config_.intermediate_size, nullptr));
@@ -248,7 +266,7 @@ class AMX_MOE_BASE {
     down_bc_pool_bytes_ = buffer_c_required_size(pool_count_, config_.down_n()) + pool_count_ * 64;
 
     mem_requests.append_pointer(&gate_up_ba_pool_, gate_up_ba_pool_bytes_);
-    if (config_.dual_pack()) {
+    if (dual_pack_) {
       // A 풀 2배 — gate≠up의 대가다 (doc §10.3).
       mem_requests.append_pointer(&up_ba_pool_, gate_up_ba_pool_bytes_);
     }
@@ -554,7 +572,7 @@ class AMX_MOE_BASE {
       const size_t g_off = (size_t)config_.gate_row_base(e);
       const size_t u_off = (size_t)config_.up_row_base(e);
       const ggml_bf16_t* xg = rows_of(config_.partial.gate, e, x_full);
-      const ggml_bf16_t* xu = config_.dual_pack() ? m_local_input_up_ptr_[e] : xg;
+      const ggml_bf16_t* xu = dual_pack_ ? m_local_input_up_ptr_[e] : xg;
       build_pair_mask(xg, config_.gate_k(e), config_.gate_k_real(e), g_a + g_off, g_c + g_off / 2,
                       thr_of(g_t, e, sp.ng, sp.grid, s_gate[j]), m_pair_mask_gate_[e].data());
       build_pair_mask(xu, config_.up_k(e), config_.up_k_real(e), u_a + u_off, u_c + u_off / 2,
@@ -665,7 +683,7 @@ class AMX_MOE_BASE {
       gather_cursor += config_.gate_k(expert_idx);
       gate_up_ba_[expert_idx]->from_mat(qlen, const_cast<ggml_bf16_t*>(a), 0, 1);
 
-      if (config_.dual_pack()) {
+      if (dual_pack_) {
         up_ba_[expert_idx]->max_m = max_m;
         up_ba_[expert_idx]->set_data(up_ba_pool_ptr);
         up_ba_pool_ptr = (void*)((uintptr_t)up_ba_pool_ptr +
@@ -739,7 +757,7 @@ class AMX_MOE_BASE {
       // 행 폭이 expert마다 다르므로 offset×폭이 아니라 누적 커서다.
       m_local_input_ptr_[i] = m_local_input_ + input_cursor;
       input_cursor += (size_t)m_local_num_[i] * config_.gate_k(i);
-      if (config_.dual_pack()) {
+      if (dual_pack_) {
         m_local_input_up_ptr_[i] = m_local_input_up_ + input_cursor_up;
         input_cursor_up += (size_t)m_local_num_[i] * config_.up_k(i);
       }
@@ -754,7 +772,7 @@ class AMX_MOE_BASE {
       gate_up_ba_[i]->set_data(gate_up_ba_pool_ptr);
       size_t ba_size = align64(buffer_a_required_size(max_m, config_.gate_k(i)));
       gate_up_ba_pool_ptr = (void*)((uintptr_t)gate_up_ba_pool_ptr + ba_size);
-      if (config_.dual_pack()) {
+      if (dual_pack_) {
         up_ba_[i]->max_m = max_m;
         up_ba_[i]->set_data(up_ba_pool_ptr);
         up_ba_pool_ptr = (void*)((uintptr_t)up_ba_pool_ptr +
@@ -806,7 +824,7 @@ class AMX_MOE_BASE {
         const size_t pos = (size_t)m_local_pos_[i][j];
         gather_rows(config_.partial.gate, e, row,
                     m_local_input_ptr_[e] + pos * (size_t)config_.gate_k(e));
-        if (config_.dual_pack()) {
+        if (dual_pack_) {
           gather_rows(config_.partial.up, e, row,
                       m_local_input_up_ptr_[e] + pos * (size_t)config_.up_k(e));
         }
@@ -815,7 +833,7 @@ class AMX_MOE_BASE {
     direct_or_pool(activated_expert, [this](int task_id) {
       int expert_idx = m_expert_id_map_[task_id];
       gate_up_ba_[expert_idx]->from_mat(m_local_num_[expert_idx], m_local_input_ptr_[expert_idx], 0, 1);
-      if (config_.dual_pack()) {
+      if (dual_pack_) {
         up_ba_[expert_idx]->from_mat(m_local_num_[expert_idx], m_local_input_up_ptr_[expert_idx], 0, 1);
       }
     });

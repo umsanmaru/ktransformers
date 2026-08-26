@@ -33,6 +33,7 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
 
  protected:
   using Base::config_;
+  using Base::dual_pack_;
   using Base::m_pair_mask_down_;
   using Base::m_pair_mask_gate_;
   using Base::m_pair_mask_up_;
@@ -121,7 +122,7 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
     int m = m_local_num_[expert_idx];
     // dual-pack이면 up이 자기 pack을 갖는다. 기하가 같으면 pack을 공유한다 —
     // 그 경우 이 분기는 항상 gate_up_ba_로 떨어져 이전과 같은 경로다.
-    auto& ba = (do_up && config_.dual_pack()) ? up_ba_[expert_idx] : gate_up_ba_[expert_idx];
+    auto& ba = (do_up && dual_pack_) ? up_ba_[expert_idx] : gate_up_ba_[expert_idx];
     auto& bb = do_up ? up_bb_[expert_idx] : gate_bb_[expert_idx];
     auto& bc = do_up ? up_bc_[expert_idx] : gate_bc_[expert_idx];
     const int gu_k = do_up ? config_.up_k(expert_idx) : config_.gate_k(expert_idx);
