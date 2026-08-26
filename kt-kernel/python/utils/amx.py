@@ -30,6 +30,7 @@ AMXFP4_KGroup_MOE = getattr(_moe_mod, "AMXFP4_KGroup_MOE", None)
 AMXMXFP8_KGroup_MOE = getattr(_moe_mod, "AMXMXFP8_KGroup_MOE", None)
 AMXFP8_MOE = getattr(_moe_mod, "AMXFP8_MOE", None)
 AMXBF16_MOE = getattr(_moe_mod, "AMXBF16_MOE", None)
+AMXBF16_RowMajorNC_MOE = getattr(_moe_mod, "AMXBF16_RowMajorNC_MOE", None)
 AMXFP8PerChannel_MOE = getattr(_moe_mod, "AMXFP8PerChannel_MOE", None)
 AVX2BF16_MOE = getattr(_moe_mod, "AVX2BF16_MOE", None)
 AVX2FP8_MOE = getattr(_moe_mod, "AVX2FP8_MOE", None)
@@ -49,6 +50,7 @@ _HAS_MXFP4_SUPPORT = AMXFP4_KGroup_MOE is not None
 _HAS_MXFP8_SUPPORT = AMXMXFP8_KGroup_MOE is not None
 _HAS_FP8_SUPPORT = AMXFP8_MOE is not None
 _HAS_BF16_SUPPORT = AMXBF16_MOE is not None
+_HAS_BF16_ROWMAJOR_NC_SUPPORT = AMXBF16_RowMajorNC_MOE is not None
 _HAS_FP8_PERCHANNEL_SUPPORT = AMXFP8PerChannel_MOE is not None
 _HAS_AVX2_BF16_SUPPORT = AVX2BF16_MOE is not None
 _HAS_AVX2_FP8_SUPPORT = AVX2FP8_MOE is not None
@@ -924,9 +926,17 @@ class NativeMoEWrapper(BaseMoEWrapper):
             _preflight_sycl_device()
             self.moe = SYCLGPTQInt4_MOE(moe_config)
         elif self.method == "BF16":
-            # BF16 has no quantization config needed
-            # Prefer AMX backend, fall back to AVX2
-            if _HAS_BF16_SUPPORT:
+            # BF16 has no quantization config needed.
+            # KT_BF16_BACKEND selects among the AMX kernels:
+            #   rowmajor_nc (default) row-major activations, n-contiguous weights
+            #   amx                   kt's original kernel
+            # Any of them falls back to AVX2 when AMX was not compiled in.
+            backend = os.environ.get("KT_BF16_BACKEND", "rowmajor_nc").strip().lower()
+            if backend == "amx" and _HAS_BF16_SUPPORT:
+                self.moe = AMXBF16_MOE(moe_config)
+            elif backend == "rowmajor_nc" and _HAS_BF16_ROWMAJOR_NC_SUPPORT:
+                self.moe = AMXBF16_RowMajorNC_MOE(moe_config)
+            elif _HAS_BF16_SUPPORT:
                 self.moe = AMXBF16_MOE(moe_config)
             else:
                 self.moe = AVX2BF16_MOE(moe_config)

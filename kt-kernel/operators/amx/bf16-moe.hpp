@@ -98,6 +98,22 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
   // CRTP virtual points - GEMM dispatch
   // ============================================================================
 
+  // 이 커널 타입에 sparse GEMV 오버로드가 있는가. kt 원본 커널에는 있고,
+  // n-contig 레이아웃 커널에는 그 레이아웃의 sparse 짝이 붙기 전까지 없다 —
+  // 없는 채로 sparse 요청이 오면 조용히 dense로 떨어지는 대신 즉사시킨다
+  // (마스킹이 조용히 사라지면 성능만 달라져 어떤 테스트도 안 잡는다).
+  static constexpr bool kHasSparseGemv = requires(std::shared_ptr<typename T::BufferA> a,
+                                                  std::shared_ptr<typename T::BufferB> b,
+                                                  std::shared_ptr<typename T::BufferC> c) {
+    amx::vec_mul_sparse(1, 1, 1, a, b, c, 0, 1, (const uint16_t*)nullptr);
+  };
+
+  static std::string sparse_unavailable_message() {
+    return T::name() +
+           ": sparse decode requested but this weight layout has no sparse GEMV yet "
+           "(port avx512_tile_k2_ymem_n16, or run with a dense plan / KT_BF16_BACKEND=amx)";
+  }
+
   void do_gate_up_gemm(bool do_up, int expert_idx, int ith, int nth, int qlen) {
     int m = m_local_num_[expert_idx];
     // dual-pack이면 up이 자기 pack을 갖는다. 기하가 같으면 pack을 공유한다 —
@@ -112,9 +128,12 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
     if (m_sparse_active_) {
       const uint16_t* mask =
           (do_up ? m_pair_mask_up_ : m_pair_mask_gate_)[expert_idx].data();
-      amx::vec_mul_sparse(m, config_.intermediate_size, gu_k, ba, bb, bc, ith, nth,
-                          mask);
-      return;
+      if constexpr (kHasSparseGemv) {
+        amx::vec_mul_sparse(m, config_.intermediate_size, gu_k, ba, bb, bc, ith, nth, mask);
+        return;
+      } else {
+        throw std::runtime_error(sparse_unavailable_message());
+      }
     }
     // Use vec_mul/mat_mul (no group_size)
     // K 치수는 접근자 경유 — partial 인스턴스면 밴드 크기, 아니면 full (동일)
@@ -129,9 +148,14 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
     int m = m_local_num_[expert_idx];
 
     if (m_sparse_active_) {
-      amx::vec_mul_sparse(m, config_.down_n(), config_.down_k(expert_idx), down_ba_[expert_idx], down_bb_[expert_idx],
-                          down_bc_[expert_idx], ith, nth, m_pair_mask_down_[expert_idx].data());
-      return;
+      if constexpr (kHasSparseGemv) {
+        amx::vec_mul_sparse(m, config_.down_n(), config_.down_k(expert_idx), down_ba_[expert_idx],
+                            down_bb_[expert_idx], down_bc_[expert_idx], ith, nth,
+                            m_pair_mask_down_[expert_idx].data());
+        return;
+      } else {
+        throw std::runtime_error(sparse_unavailable_message());
+      }
     }
     if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
       amx::mat_mul(m, config_.down_n(), config_.down_k(expert_idx), down_ba_[expert_idx], down_bb_[expert_idx],
@@ -336,6 +360,19 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
                                [[maybe_unused]] const std::vector<uintptr_t>& w13_scale_ptrs,
                                const std::vector<uintptr_t>& w2_weight_ptrs,
                                [[maybe_unused]] const std::vector<uintptr_t>& w2_scale_ptrs) const {
+    // 아래 언팩은 BufferBBF16Impl의 주소식을 손으로 펼쳐 BufferB를 걷는다.
+    // weight가 다른 레이아웃에 있는 커널은 **조용히** 틀린 오프셋에서 읽히므로
+    // 거부한다 (rmnc-port 0002 패치 — partial 가드보다 앞에 둔다: 레이아웃
+    // 불일치가 더 근본적인 거부 사유다).
+    if constexpr (requires { T::N_CONTIG_B_LAYOUT; }) {
+      if (T::N_CONTIG_B_LAYOUT) {
+        throw std::runtime_error(
+            "write_weights_to_buffer assumes the BufferBBF16Impl weight layout, but " + T::name() +
+            " stores weights n-contiguously. Port the address arithmetic in unpack_nk_block_bf16 and the two "
+            "bb->b expressions below before enabling GPU offload for this kernel.");
+      }
+    }
+
     auto& config = config_;
     // Prism partial 인스턴스는 GPU writeback을 지원하지 않는다 (fused forward를
     // 거부하는 것과 같은 이유·같은 형태의 가드다).

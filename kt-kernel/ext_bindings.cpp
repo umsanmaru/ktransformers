@@ -43,6 +43,10 @@ static const bool _is_plain_ = false;
 
 #if defined(__x86_64__) && defined(USE_AMX_AVX_KERNEL)
 #include "operators/amx/awq-moe.hpp"
+// bf16-moe.hpp보다 **먼저** 와야 한다: 그 헤더가 amx::mat_mul / amx::vec_mul을
+// qualified name으로 부르므로, 새 커널의 오버로드가 그 전에 선언돼 있어야
+// 인스턴스화 시점에 해소된다.
+#include "operators/amx/la/bf16_rowmajor.hpp"    // Row-major activation/accumulator BF16 kernels
 #include "operators/amx/bf16-moe.hpp"            // Native BF16 MoE using CRTP pattern, with fallback for AVX512F
 #include "operators/amx/fp4-moe.hpp"             // MXFP4 MoE: FP4 E2M1 weights × BF16 activations
 #include "operators/amx/fp8-moe.hpp"             // FP8 MoE requires AVX512 BF16 support, with fallback for AVX512F+BW
@@ -1002,6 +1006,12 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   bind_moe_module<AMX_K2_MOE_TP<amx::GemmKernel224Int4SmallKGroupBlocked>>(moe_module, "AMXInt4_KGroupBlocked_MOE");
 #if defined(__AVX512F__)
   bind_moe_module<AMX_BF16_MOE_TP<amx::GemmKernel224BF16>, /*WithPartial=*/true>(moe_module, "AMXBF16_MOE");
+  // rmnc-port: row-major activations over n-contiguous weights. WithPartial은
+  // 아직 false다 — partial의 sparse 분기가 amx::vec_mul_sparse를 부르는데 그
+  // 오버로드가 GemmKernel224BF16 버퍼에 하드코딩돼 있다. NC 레이아웃의 sparse
+  // 짝(avx512_tile_k2_ymem_n16)이 붙는 시점에 true로 바꾼다.
+  bind_moe_module<AMX_BF16_MOE_TP<amx::GemmKernel224BF16RowMajorNC>>(moe_module,
+                                                                     "AMXBF16_RowMajorNC_MOE");
   bind_moe_module<AMX_FP8_MOE_TP<amx::GemmKernel224FP8>>(moe_module, "AMXFP8_MOE");
   bind_moe_module<AMX_FP8_PERCHANNEL_MOE_TP<amx::GemmKernel224FP8PerChannel>>(moe_module, "AMXFP8PerChannel_MOE");
   bind_moe_module<AMX_FP4_MOE_TP<amx::GemmKernel224MXFP4SmallKGroup>>(moe_module, "AMXFP4_KGroup_MOE");
