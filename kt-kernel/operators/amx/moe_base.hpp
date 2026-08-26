@@ -437,6 +437,41 @@ class AMX_MOE_BASE {
     return scratch;
   }
 
+  // ── prep 태스크용 소프트웨어 prefetch ────────────────────────────────
+  //
+  // prep의 스칼라 루프(gather, build_pair_mask, build_plan)는 명령 수가 아니라
+  // cold miss의 지연으로 시간을 쓴다 — expert별 점수 테이블은 매 스텝 다른
+  // expert라 L2에 없고, 루프가 한 라인씩 순서대로 찍으니 MLP가 1~2에 머문다.
+  // HW prefetcher가 켜진 소켓은 순차 스캔을 앞서 가져와 대부분 숨기지만, 꺼진
+  // 소켓에서는 miss가 하나씩 노출된다 (2026-08-26: prep 잔여 ~17 vs ~55 µs).
+  // 태스크가 만질 입력(합쳐 ~16-24 KB, L2에 넉넉히 든다)을 시작 시 한꺼번에
+  // 발행해 두면 SQ가 꽉 찬 채로 채워지고, 뒤따르는 루프는 L2에서 돈다.
+  static inline void prefetch_bytes(const void* p, size_t bytes) {
+    const char* c = reinterpret_cast<const char*>(p);
+    const char* end = c + bytes;
+    for (; c < end; c += 64) {
+      _mm_prefetch(c, _MM_HINT_T1);
+    }
+  }
+
+  // (proj, expert) 하나의 prep 입력: x — 밴드는 그 구간만, 인덱스형은 인덱스
+  // 배열과 x 행 전체(gather가 x를 임의 순서로 찍으므로) — 와 점수 테이블
+  // a(k×4B)/c(k/2×4B). sparse가 아니면 x만.
+  void prefetch_prep_inputs(const KIndex& ki, int64_t e, const ggml_bf16_t* row, int axis_len, const float* a,
+                            const float* c, bool sparse) const {
+    const int kr = ki.k((int)e);
+    if (ki.indexed()) {
+      prefetch_bytes(ki.index_of((int)e), (size_t)kr * sizeof(uint16_t));
+      prefetch_bytes(row, (size_t)axis_len * sizeof(ggml_bf16_t));
+    } else {
+      prefetch_bytes(row + ki.offset, (size_t)kr * sizeof(ggml_bf16_t));
+    }
+    if (sparse) {
+      prefetch_bytes(a, (size_t)kr * sizeof(float));
+      prefetch_bytes(c, (size_t)(kr / 2) * sizeof(float));
+    }
+  }
+
   // ── k2wl2 페어 마스크 (계약 ①) ────────────────────────────────────────
   // imp_j = sqrt(max(a[2j]·x0² + a[2j+1]·x1² + 2·c[j]·x0·x1, 0)) >= thr
   //
@@ -552,6 +587,7 @@ class AMX_MOE_BASE {
   // worker 안의 throw는 uncaught → std::terminate이므로 여기서는 던지지 않는다.
   void prep_gateup_decode(int k, const int64_t* expert_ids, const ggml_bf16_t* x_full, const float* weights) {
     const int qlen = 1;
+    const int H = config_.hidden_size;
     const auto& sp = config_.partial.sparsity;
     const bool sparse = sp.enabled && weights != nullptr;
     const float* g_a = (const float*)sp.gate_wn_sq;
@@ -567,40 +603,72 @@ class AMX_MOE_BASE {
       slot_sparsity(weights, k, sp.p_up, sp.lam_up, sp.pmax, sp.renorm_it, s_up);
     }
 
+    // dual_pack이면 gate와 up이 각자 gather/pack하므로 태스크를 둘로 나눈다
+    // (병렬도 A → 2A). 아니면 up 마스크가 gate의 gather 결과를 읽으므로 한
+    // 태스크에 둔다 — 태스크 간 의존은 어느 경우에도 없다.
+    const bool dual = dual_pack_;
     auto pool = config_.pool->get_subpool(tp_part_idx);
     pool->do_work_stealing_job(
-        k, nullptr,
-        [&](int j) {
+        dual ? 2 * k : k, nullptr,
+        [&](int t) {
+          const int j = dual ? (t >> 1) : t;
+          const bool do_up = dual && (t & 1);
           const int64_t e = expert_ids[j];
           if (config_.should_skip_expert(e)) {
-            return;
-          }
-          // gather(인덱스형) + pack. 퇴화형(밴드)은 원본을 가리켜 복사 0.
-          const ggml_bf16_t* xg = dense_rows(config_.partial.gate, e, x_full, m_local_input_ptr_[e]);
-          gate_up_ba_[e]->from_mat(qlen, const_cast<ggml_bf16_t*>(xg), 0, 1);
-          const ggml_bf16_t* xu = xg;
-          if (dual_pack_) {
-            xu = dense_rows(config_.partial.up, e, x_full, m_local_input_up_ptr_[e]);
-            up_ba_[e]->from_mat(qlen, const_cast<ggml_bf16_t*>(xu), 0, 1);
-          }
-          if (!sparse) {
             return;
           }
           // 점수 테이블도 weight와 같은 인덱스로 gather되어 들어오므로, expert
           // 오프셋은 행 기준 row_base다 (균일 밴드에서는 e*rows와 같다).
           const size_t g_off = (size_t)config_.gate_row_base(e);
           const size_t u_off = (size_t)config_.up_row_base(e);
-          build_pair_mask(xg, config_.gate_k(e), config_.gate_k_real(e), g_a + g_off, g_c + g_off / 2,
+          const float* ga = g_a + g_off;
+          const float* gc = g_c + g_off / 2;
+          const float* ua = u_a + u_off;
+          const float* uc = u_c + u_off / 2;
+
+          if (do_up) {
+            prefetch_prep_inputs(config_.partial.up, e, x_full, H, ua, uc, sparse);
+            const ggml_bf16_t* xu = dense_rows(config_.partial.up, e, x_full, m_local_input_up_ptr_[e]);
+            up_ba_[e]->from_mat(qlen, const_cast<ggml_bf16_t*>(xu), 0, 1);
+            if (!sparse) {
+              return;
+            }
+            build_pair_mask(xu, config_.up_k(e), config_.up_k_real(e), ua, uc,
+                            thr_of(u_t, e, sp.ng, sp.grid, s_up[j]), m_pair_mask_up_[e].data());
+            if constexpr (kHasPlanEncoder) {
+              T::build_plan(m_pair_mask_up_[e].data(), xu, config_.up_k(e), plan_arena_for((int)e, 1),
+                            &m_plan_up_[e]);
+            }
+            return;
+          }
+
+          prefetch_prep_inputs(config_.partial.gate, e, x_full, H, ga, gc, sparse);
+          if (!dual && sparse) {
+            // up은 gate의 행을 공유한다 — 테이블만 따로 든다.
+            prefetch_bytes(ua, (size_t)config_.up_k(e) * sizeof(float));
+            prefetch_bytes(uc, (size_t)(config_.up_k(e) / 2) * sizeof(float));
+          }
+          // gather(인덱스형) + pack. 퇴화형(밴드)은 원본을 가리켜 복사 0.
+          const ggml_bf16_t* xg = dense_rows(config_.partial.gate, e, x_full, m_local_input_ptr_[e]);
+          gate_up_ba_[e]->from_mat(qlen, const_cast<ggml_bf16_t*>(xg), 0, 1);
+          if (!sparse) {
+            return;
+          }
+          build_pair_mask(xg, config_.gate_k(e), config_.gate_k_real(e), ga, gc,
                           thr_of(g_t, e, sp.ng, sp.grid, s_gate[j]), m_pair_mask_gate_[e].data());
-          build_pair_mask(xu, config_.up_k(e), config_.up_k_real(e), u_a + u_off, u_c + u_off / 2,
-                          thr_of(u_t, e, sp.ng, sp.grid, s_up[j]), m_pair_mask_up_[e].data());
           if constexpr (kHasPlanEncoder) {
             // 마스크(정책, 절대 k)를 커널의 자료구조로 인코딩한다 — expert당
             // 1회, 결과는 read-only로 전 워커가 공유한다.
             T::build_plan(m_pair_mask_gate_[e].data(), xg, config_.gate_k(e), plan_arena_for((int)e, 0),
                           &m_plan_gate_[e]);
-            T::build_plan(m_pair_mask_up_[e].data(), xu, config_.up_k(e), plan_arena_for((int)e, 1),
-                          &m_plan_up_[e]);
+          }
+          if (!dual) {
+            build_pair_mask(xg, config_.up_k(e), config_.up_k_real(e), ua, uc,
+                            thr_of(u_t, e, sp.ng, sp.grid, s_up[j]), m_pair_mask_up_[e].data());
+            if constexpr (kHasPlanEncoder) {
+              T::build_plan(m_pair_mask_up_[e].data(), xg, config_.up_k(e), plan_arena_for((int)e, 1),
+                            &m_plan_up_[e]);
+            }
           }
         },
         nullptr);
@@ -614,7 +682,7 @@ class AMX_MOE_BASE {
     const float* d_a = (const float*)sp.down_wn_sq;
     const float* d_c = (const float*)sp.down_pair_dot;
     const float* d_t = (const float*)sp.thr_down;
-    const size_t act_row = (size_t)config_.n_total();  // act의 slot 행 stride
+    const int act_row = config_.n_total();  // act의 slot 행 stride = down K 축 길이
 
     float s_down[kMaxTopK];
     if (sparse) {
@@ -629,14 +697,17 @@ class AMX_MOE_BASE {
           if (config_.should_skip_expert(e)) {
             return;
           }
-          const ggml_bf16_t* src =
-              dense_rows(config_.partial.down, e, act + (size_t)j * act_row, m_local_input_ptr_[e]);
+          const size_t off = (size_t)config_.down_row_base(e);
+          const float* da = d_a + off;
+          const float* dc = d_c + off / 2;
+          const ggml_bf16_t* row = act + (size_t)j * act_row;
+          prefetch_prep_inputs(config_.partial.down, e, row, act_row, da, dc, sparse);
+          const ggml_bf16_t* src = dense_rows(config_.partial.down, e, row, m_local_input_ptr_[e]);
           down_ba_[e]->from_mat(qlen, const_cast<ggml_bf16_t*>(src), 0, 1);
           if (!sparse) {
             return;
           }
-          const size_t off = (size_t)config_.down_row_base(e);
-          build_pair_mask(src, config_.down_k(e), config_.down_k_real(e), d_a + off, d_c + off / 2,
+          build_pair_mask(src, config_.down_k(e), config_.down_k_real(e), da, dc,
                           thr_of(d_t, e, sp.ng, sp.grid, s_down[j]), m_pair_mask_down_[e].data());
           if constexpr (kHasPlanEncoder) {
             T::build_plan(m_pair_mask_down_[e].data(), src, config_.down_k(e), plan_arena_for((int)e, 2),
