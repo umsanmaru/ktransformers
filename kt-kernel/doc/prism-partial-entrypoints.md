@@ -397,3 +397,20 @@ pack에 쓴 것과 같은 포인터(`dense_rows`의 반환값)를 읽는다.
 
 `worker_pool.cpp`: `do_numa_job`의 대기 spin에 `_mm_pause()`. 이 스레드는 바인딩이
 없어 워커의 HT 형제에 앉기 쉽고, 그때 gateup decode가 ~10% 느려지는 것이 측정됐다.
+
+## 12. prep과 GEMV의 단일 job 융합 (2026-08-26, 3차)
+
+`prep_*_decode` + `run_*_stage`(job 2개, 경계 2회) → `run_*_decode`(job 1개). 태스크
+id 앞쪽 nprep개가 prep, 뒤쪽이 GEMV 슬랩(분해는 run_*_stage와 동일). GEMV 슬랩은
+`plan_ready_[3e + slot]`(gate/up/down)을 acquire로 기다리고, prep 태스크가 끝에
+release로 세운다. 라우팅이 routed expert만 0으로 내린다(전 E 리셋은 E-비례 비용).
+`curr_.fetch_add(1)`이 id 순서로 나눠 주므로 슬랩이 분배되는 시점엔 모든 prep이
+이미 잡혀 있고 prep은 블록 없이 끝난다 — 교착 없음. `m_sparse_active_`는
+`do_*_gemm`이 읽으므로 job 전에 세운다. dense 호출(weights 없음)에서도 플래그는
+pack 완료를 뜻하므로 필요하다.
+
+효과는 작다(측정 노이즈 수준, ≤3%): 8스레드 s0 dense 311→308, s1 dense 341→342,
+s1 sp50 201→206 µs; 6스레드 문서 동작점 297→285(s0), 231→221(s1). job 경계 1회의
+실제 비용이 도식 추정(~6 µs)보다 작았다는 뜻이다. 남은 격차(플랫폼 대비 s1 ~40 µs,
+s0 ~20 µs)는 커널 외 고정비 — GEMV tail, m_0의 route/export, 그리고 호출 경로의
+스레드 홉(python → TaskQueue 워커(cv wait) → NUMA 메인 워커) — 쪽을 봐야 한다.
