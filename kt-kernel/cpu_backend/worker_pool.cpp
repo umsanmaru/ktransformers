@@ -22,6 +22,17 @@
 
 #include "hwloc.h"
 
+// do_numa_job의 호출 스레드는 NUMA 풀이 끝나길 기다리며 spin한다. 그 스레드는
+// 바인딩이 없어 워커의 HT 형제 위에 앉기 쉽고, pause 없는 spin은 형제 코어의
+// 파이프라인·L2 fill 자원을 나눠 쓴다 (2026-08-26: gateup decode 398 → 363 µs를
+// 스핀 스레드를 다른 소켓으로 옮기는 것만으로 얻었다). pause는 그 간섭을 줄인다.
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#define KT_SPIN_PAUSE() _mm_pause()
+#else
+#define KT_SPIN_PAUSE() ((void)0)
+#endif
+
 thread_local int WorkerPool::thread_local_id = -1;
 
 InNumaPool::InNumaPool(int max_thread_num) {
@@ -390,6 +401,7 @@ void NumaJobDistributor::do_numa_job(std::function<void(int)> compute_func) {
     if (i == me_numa) continue;
 
     while (status[i]->load(std::memory_order_acquire) == ThreadStatus::WORKING) {
+      KT_SPIN_PAUSE();
     }
   }
 }
@@ -405,6 +417,7 @@ void NumaJobDistributor::do_numa_job(std::function<void(int)> compute_func) {
   }
   for (int i = 0; i < numa_count; i++) {
     while (status[i]->load(std::memory_order_acquire) == ThreadStatus::WORKING) {
+      KT_SPIN_PAUSE();
     }
   }
 }

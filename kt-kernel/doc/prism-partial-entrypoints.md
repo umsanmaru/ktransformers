@@ -157,6 +157,8 @@ self-serve, 우리는 prism ExecutionResources가 소유하고 wrapper에 포인
 - `forward_gateup_partial` (moe_base.hpp): prepare_gateup_routing →
   carve_and_pack_gateup → run_gateup_stage(CRTP seam 경유) →
   export_gateup_partial. 단일 책임 4함수. K1은 qlen==1만 (guard).
+  (2026-08-26: carve_and_pack_gateup은 `carve_gateup_decode`(포인터) +
+  `prep_gateup_decode`(워커 병렬 gather/pack/마스크/plan)로 분리 — §11)
 - fused `forward`는 partial 인스턴스에서 throw (조용한 오답 방지 guard).
 - TP: TP_MOE_Common::forward_gateup_partial — 노드 디스패치만, merge 없음.
 - 테스트: test/prism/test_partial_moe.py (레퍼런스 tolerance + 정수
@@ -165,7 +167,8 @@ self-serve, 우리는 prism ExecutionResources가 소유하고 wrapper에 포인
 ## 8. K2 구현 형태 (as-built, 2026-08-20)
 
 - **down N(hidden)-split 완성**: forward_down_partial = prepare_down_routing
-  → carve_and_pack_down(slot별 act 행에서 down K 밴드 pack) → run_down_stage
+  → carve_and_pack_down(slot별 act 행에서 down K 밴드 pack; 2026-08-26부터
+  `carve_down_decode` + `prep_down_decode`, §11) → run_down_stage
   (CRTP do_down_gemm, N=down_n()) → export_down_partial(자기 hidden shard 열
   direct write). 노드 합산 없음. gateup과 완전 동형.
 - **per-node shard 테이블**: PartialGeometry에 top-level 테이블 4 vector
@@ -370,3 +373,27 @@ plan/자산이 지키는 정렬은 페어(%2)뿐인데 packed 저장은 `K_STEP`
   prefill 파라미터화. 밴드에서는 이 테스트가 순서를 검증하지 못한다 — 어느
   순서로 더해도 같은 행이기 때문이고, 셔플에서 비로소 검출기가 된다.
 - gate ≠ up 조합, `k[e] == 0`인 expert가 섞인 구성, 불균등 NUMA shard × prefill.
+
+## 11. decode 준비 단계의 워커 병렬화 (2026-08-26)
+
+측정(sglang `cold_bench_results/a2a/README.md`, Qwen3.6-35B gateup shape, 8스레드)에서
+`forward_gateup_partial(qlen==1)`의 GEMV 앞 구간 — x gather, `from_mat` pack,
+`build_pair_mask`, `build_plan` — 이 호출 스레드(NUMA 풀 메인 워커) 하나에서
+순차로 돌며 스텝당 **~75 µs(HW prefetcher on) / ~280 µs(off)** 를 먹었다. 커널
+본체(~290 µs)와 같은 자릿수이고, 그동안 나머지 워커는 spin. 원인은 expert별
+점수 테이블(`wn_sq`/`pair_dot`, fp32 [E·k])이 매 스텝 cold라 스칼라 루프가
+지연 바운드가 되는 것 — 이것이 프로파일에 "E×A 항"으로 보이던 것의 실체다.
+
+변경: `carve_and_pack_*` → `carve_*_decode`(포인터 carving만, 순차) +
+`prep_*_decode`(slot당 태스크 1개의 work-stealing job: gather → pack →
+`build_pair_mask` → `build_plan`). `build_*_masks`는 prep에 흡수되어 사라졌다.
+gate와 up은 한 태스크에 둔다 — dual_pack이 아니면 up 마스크가 gate의 gather
+결과를 읽으므로 태스크 간 의존을 만들지 않기 위해서다. 마스크·plan의 산술과
+순서는 그대로다(비트 동일 — `tests/prism_partial_golden.py`로 전/후 대조).
+
+부수 수정: dual_pack이면서 up이 밴드형(인덱스 없음)일 때 예전 코드는 up 마스크의
+x로 **쓰이지 않은** 스크래치(`m_local_input_up_ptr_[e]`)를 읽었다. 이제 마스크는
+pack에 쓴 것과 같은 포인터(`dense_rows`의 반환값)를 읽는다.
+
+`worker_pool.cpp`: `do_numa_job`의 대기 spin에 `_mm_pause()`. 이 스레드는 바인딩이
+없어 워커의 HT 형제에 앉기 쉽고, 그때 gateup decode가 ~10% 느려지는 것이 측정됐다.
