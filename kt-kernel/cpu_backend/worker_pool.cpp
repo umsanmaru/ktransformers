@@ -79,7 +79,10 @@ InNumaPool::InNumaPool(int max_thread_num, int numa_id, int threads_id_start) {
     }
     core_obj = hwloc_get_obj_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_CORE, i + threads_id_start);
     if (!core_obj) {
-      fprintf(stderr, "Core %d inside NUMA node %d not found\n", i, numa_id);
+      fprintf(stderr,
+              "Core %d inside NUMA node %d not found — thread stays unbound and "
+              "may run on a remote socket (silent slowdown)\n",
+              i + threads_id_start, numa_id);
       // throw std::runtime_error("Core not found inside NUMA node");
       continue;
     }
@@ -235,6 +238,21 @@ void InNumaPool::worker_thread(int thread_id, int numa_id) {
   }
 }
 
+namespace {
+// 노드 id로 인덱싱하는 보조 테이블의 크기를 정하기 위한 최대 노드 id.
+// subpool_numa_map은 임의의 노드를 가리킬 수 있으므로 (단일 소켓 실행은
+// map 전체가 GPU가 붙은 노드 하나다) 크기를 map 길이로 잡으면 안 된다.
+int max_node_id(const std::vector<int>& numa_ids) {
+  int m = 0;
+  for (int id : numa_ids) {
+    if (id > m) {
+      m = id;
+    }
+  }
+  return m;
+}
+}  // namespace
+
 NumaJobDistributor::NumaJobDistributor(int numa_count) {
   std::vector<int> numa_ids;
   for (int i = 0; i < numa_count; i++) {
@@ -282,7 +300,14 @@ void NumaJobDistributor::init(std::vector<int> numa_ids, std::vector<int> thread
   }
 
   workers.resize(numa_count);
-  std::vector<int> numa_threads_count(numa_count, 0);
+  // **노드 id로 인덱싱하므로 크기가 노드 수여야 한다** (subpool 수가 아니다).
+  // numa_count는 subpool 수이고 numa_ids[i]는 물리 노드 id다 — 단일 소켓
+  // 실행에서 subpool 1개가 node 1에 붙으면 numa_threads_count[1]이 크기 1
+  // 벡터의 범위 밖 읽기가 되어, 쓰레기 값이 코어 인덱스로 들어가 바인딩이
+  // 조용히 생략된다. 바인딩 실패는 결과를 바꾸지 않고 느리게만 만들므로
+  // (스레드가 원격 소켓에 앉아 데이터를 링크 건너 읽는다) 어떤 테스트도
+  // 잡아주지 않고, 값이 매번 달라져 성능이 실행마다 추첨이 된다.
+  std::vector<int> numa_threads_count(max_node_id(numa_ids) + 1, 0);
   for (int i = 0; i < numa_count; i++) {
     workers[i] = std::thread(&NumaJobDistributor::worker_thread, this, i);
     auto this_numa = numa_ids[i];
@@ -301,7 +326,10 @@ void NumaJobDistributor::init(std::vector<int> numa_ids, std::vector<int> thread
     }
     core_obj = hwloc_get_obj_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_CORE, start_id);
     if (!core_obj) {
-      fprintf(stderr, "Core %d inside NUMA node %d not found\n", 0, this_numa);
+      fprintf(stderr,
+              "Core %d inside NUMA node %d not found — thread stays unbound and "
+              "may run on a remote socket (silent slowdown)\n",
+              start_id, this_numa);
       // throw std::runtime_error("Core not found inside NUMA node");
       continue;
     }
@@ -421,7 +449,8 @@ void WorkerPool::init(WorkerPoolConfig config) {
   for (int i = 0; i < config.subpool_count; i++) {
     numa_worker_pools.push_back(nullptr);
   }
-  std::vector<int> numa_threads_count(config.subpool_count, 0);
+  // 노드 id로 인덱싱한다 — 크기는 subpool 수가 아니라 노드 수다 (위 주석 참조).
+  std::vector<int> numa_threads_count(max_node_id(config.subpool_numa_map) + 1, 0);
   for (int i = 0; i < config.subpool_count; i++) {
     auto this_numa = config.subpool_numa_map[i];
     auto this_thread_count = config.subpool_thread_count[i];
