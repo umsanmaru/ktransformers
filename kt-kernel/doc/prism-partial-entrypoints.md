@@ -397,3 +397,25 @@ pack에 쓴 것과 같은 포인터(`dense_rows`의 반환값)를 읽는다.
 
 `worker_pool.cpp`: `do_numa_job`의 대기 spin에 `_mm_pause()`. 이 스레드는 바인딩이
 없어 워커의 HT 형제에 앉기 쉽고, 그때 gateup decode가 ~10% 느려지는 것이 측정됐다.
+
+## 12. prep·GEMV 단일 job 융합 — 시도 후 되돌림 (2026-08-26)
+
+prep 태스크와 GEMV 슬랩을 한 work-stealing job에 싣고 슬랩이 expert별 `plan_ready_`
+플래그를 기다리게 해 job 경계 1회를 없애 봤다(034d340). 골든은 비트 동일했지만 효과가
+측정 노이즈 안이었고(s0 dense 311→308, s1 dense 341→342, s1 sp50 201→206 µs) 구조만
+복잡해져 되돌렸다(3aff321). 교훈: job 경계 1회의 실제 비용은 도식이 가정한 ~6 µs보다
+작다. 잔여 격차(플랫폼 대비 s1 ~40 µs, s0 ~20 µs)는 커널 밖 고정비 — GEMV tail,
+m_0의 route/export, 호출 경로의 스레드 홉(python → TaskQueue 워커 cv wake → NUMA
+메인 워커) — 쪽이다.
+
+## 13. build_pair_mask AVX-512 벡터화 (2026-08-26)
+
+`operators/amx/pair_mask.hpp`. 한 워드(16 페어)가 zmm 하나: x 32 bf16을 통째로 들어
+shift/and로 x0·x1, a_sq 두 zmm을 even/odd `permutex2var`로 a0·a1, c 16 fp32 연속,
+`cmp_ps_mask`의 __mmask16이 곧 출력 워드. **연산 순서는 스칼라 원본이 `-ffast-math`
+아래에서 실제로 컴파일된 결과(objdump)를 그대로 재현**한다:
+`e = fma(a0, x0*x0, fma(a1, x1, (c+c)*x0) * x1); e = max(e, 0); bit = e >= thr2`.
+그 파일만 `#pragma GCC optimize("no-fast-math", "fp-contract=off")`로 컴파일러의
+재결합을 막아 intrinsic 하나 = IEEE 연산 하나로 남긴다. 그래서 골든이 비트 동일하다.
+AVX-512가 없으면 같은 순서의 스칼라 폴백.
+

@@ -33,6 +33,7 @@
 #include "../common.hpp"
 #include "../moe-tp.hpp"
 #include "la/act_plan.hpp"
+#include "pair_mask.hpp"
 #include "la/amx.hpp"
 #include "llama.cpp/ggml.h"
 
@@ -489,33 +490,12 @@ class AMX_MOE_BASE {
   // k_real < k_rows이면 그 차이는 타일 경계까지 올린 **패딩 행**이다. 해당
   // 페어의 비트는 끈다: weight가 0이라 수치에는 영향이 없지만, thr == 0일 때
   // 비트가 서면 쓸모없는 B 로드가 생긴다.
-  static constexpr int PAIRS_PER_WORD = 16;
+  // 구현은 pair_mask.hpp (AVX-512, 16 페어 = zmm 하나). 연산 순서는 이 자리에
+  // 있던 스칼라 루프가 -ffast-math 아래에서 컴파일된 결과와 동일하게 고정돼
+  // 있어(그 파일은 fast-math를 끈다) 마스크가 비트 동일하다.
   static void build_pair_mask(const ggml_bf16_t* src, int k_rows, int k_real, const float* a_sq, const float* c,
                               float thr, uint16_t* out) {
-    const float thr2 = thr * thr;
-    const int pairs = k_rows / 2;
-    const int pairs_real = k_real / 2;
-    const int words = pairs / PAIRS_PER_WORD;
-    for (int t = 0; t < words; t++) {
-      uint16_t bits = 0;
-      const int base = t * PAIRS_PER_WORD;
-      for (int j = 0; j < PAIRS_PER_WORD; j++) {
-        if (base + j >= pairs_real) {
-          break;  // 패딩 페어 — 비트를 끈 채로 둔다
-        }
-        const int p = base + j;
-        const float x0 = GGML_BF16_TO_FP32(src[2 * p]);
-        const float x1 = GGML_BF16_TO_FP32(src[2 * p + 1]);
-        float e = a_sq[2 * p] * x0 * x0 + a_sq[2 * p + 1] * x1 * x1 + 2.0f * c[p] * x0 * x1;
-        if (e < 0.0f) {
-          e = 0.0f;
-        }
-        if (e >= thr2) {
-          bits |= (uint16_t)1 << j;
-        }
-      }
-      out[t] = bits;
-    }
+    amx::build_pair_mask(src, k_rows, k_real, a_sq, c, thr, out);
   }
 
   // 예산 → s 벡터 (계약 ①). w는 [k] 라우터 가중으로, 정규화되지 않았을 수
