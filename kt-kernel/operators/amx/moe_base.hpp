@@ -32,6 +32,7 @@
 #include "../../cpu_backend/worker_pool.h"
 #include "../common.hpp"
 #include "../moe-tp.hpp"
+#include "la/act_plan.hpp"
 #include "la/amx.hpp"
 #include "llama.cpp/ggml.h"
 
@@ -62,6 +63,21 @@ class AMX_MOE_BASE {
   // gate_up_ba_를 공유하므로 마스크를 A에 구울 수 없다 — 계약 ①).
   // decode(qlen==1)에서만 채워진다: prefill은 토큰별 마스크가 B 재사용을
   // 깨서 이득이 없다 (prefill-dense).
+  // 이 커널이 Seam B 인코더를 갖는가. 없으면 plan 관련 코드가 전부
+  // 컴파일아웃되어 기존 operator는 무변경이다. (CRTP 파생이 소비하므로
+  // 멤버들과 같은 접근 구역에 둔다.)
+  static constexpr bool kHasPlanEncoder = requires { T::plan_arena_bytes(1); };
+
+  void* plan_arena_for(int e, int slot) const {
+    return (char*)m_plan_arena_ + (size_t)slot * m_plan_off_.back() + m_plan_off_[e];
+  }
+
+  // Seam B: 커널이 자기 blocking으로 인코딩한 per-expert 계획. 인코더가 없는
+  // 커널에서는 비어 있고 아무도 읽지 않는다.
+  ggml_bf16_t* m_plan_arena_ = nullptr;
+  std::vector<amx::ActivationPlan> m_plan_gate_, m_plan_up_, m_plan_down_;
+  std::vector<size_t> m_plan_off_;  // [E+1] expert별 arena 오프셋 (바이트)
+
   std::vector<std::vector<uint16_t>> m_pair_mask_gate_;
   std::vector<std::vector<uint16_t>> m_pair_mask_up_;
   std::vector<std::vector<uint16_t>> m_pair_mask_down_;
@@ -176,6 +192,22 @@ class AMX_MOE_BASE {
     }
     m_local_input_ptr_.resize(config_.expert_num);
     m_local_input_up_ptr_.resize(config_.expert_num);
+    if constexpr (kHasPlanEncoder) {
+      // per-expert K 때문에 arena도 expert별이다 — seg 길이가 k/K_BLOCK + 2라
+      // expert마다 다르다 (KT_MERGE_CONTRACT §8.3 마지막 항).
+      m_plan_off_.assign(config_.expert_num + 1, 0);
+      for (int e = 0; e < config_.expert_num; e++) {
+        const size_t need = std::max({T::plan_arena_bytes(config_.gate_k(e)),
+                                      T::plan_arena_bytes(config_.up_k(e)),
+                                      T::plan_arena_bytes(config_.down_k(e))});
+        m_plan_off_[e + 1] = m_plan_off_[e] + ((need + 63) & ~(size_t)63);
+      }
+      // gate/up/down 세 벌 (한 레이어 안에서 동시에 살아 있다)
+      mem_requests.append_pointer(&m_plan_arena_, 3 * m_plan_off_.back());
+      m_plan_gate_.resize(config_.expert_num);
+      m_plan_up_.resize(config_.expert_num);
+      m_plan_down_.resize(config_.expert_num);
+    }
     m_local_gate_output_ptr_.resize(config_.expert_num);
     m_local_up_output_ptr_.resize(config_.expert_num);
     m_local_down_output_ptr_.resize(config_.expert_num);
@@ -527,6 +559,14 @@ class AMX_MOE_BASE {
                       thr_of(g_t, e, sp.ng, sp.grid, s_gate[j]), m_pair_mask_gate_[e].data());
       build_pair_mask(xu, config_.up_k(e), config_.up_k_real(e), u_a + u_off, u_c + u_off / 2,
                       thr_of(u_t, e, sp.ng, sp.grid, s_up[j]), m_pair_mask_up_[e].data());
+      if constexpr (kHasPlanEncoder) {
+        // 마스크(정책, 절대 k)를 커널의 자료구조로 인코딩한다 — 호출 스레드에서
+        // expert당 1회, 결과는 read-only로 전 워커가 공유한다.
+        T::build_plan(m_pair_mask_gate_[e].data(), xg, config_.gate_k(e),
+                      plan_arena_for((int)e, 0), &m_plan_gate_[e]);
+        T::build_plan(m_pair_mask_up_[e].data(), xu, config_.up_k(e),
+                      plan_arena_for((int)e, 1), &m_plan_up_[e]);
+      }
     }
     m_sparse_active_ = true;
   }
@@ -556,6 +596,10 @@ class AMX_MOE_BASE {
       const ggml_bf16_t* src = rows_of(config_.partial.down, e, act + (size_t)j * act_row);
       build_pair_mask(src, rows, config_.down_k_real(e), d_a + off, d_c + off / 2,
                       thr_of(d_t, e, sp.ng, sp.grid, s_down[j]), m_pair_mask_down_[e].data());
+      if constexpr (kHasPlanEncoder) {
+        T::build_plan(m_pair_mask_down_[e].data(), src, config_.down_k(e),
+                      plan_arena_for((int)e, 2), &m_plan_down_[e]);
+      }
     }
     m_sparse_active_ = true;
   }

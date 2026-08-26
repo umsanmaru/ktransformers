@@ -43,6 +43,9 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
   using Base::gate_bb_;
   using Base::gate_bc_;
   using Base::gate_up_ba_;
+  using Base::m_plan_down_;
+  using Base::m_plan_gate_;
+  using Base::m_plan_up_;
   using Base::up_ba_;
   using Base::m_local_num_;
   using Base::tp_part_idx;
@@ -128,7 +131,14 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
     if (m_sparse_active_) {
       const uint16_t* mask =
           (do_up ? m_pair_mask_up_ : m_pair_mask_gate_)[expert_idx].data();
-      if constexpr (kHasSparseGemv) {
+      if constexpr (Base::kHasPlanEncoder) {
+        // 커널이 자기 스케줄을 소유한다 (Seam A/B): 마스크는 이미 plan으로
+        // 인코딩됐고 pval이 활성값을 나르므로 A 접근도 없다.
+        const amx::ActivationPlan& pl = do_up ? m_plan_up_[expert_idx] : m_plan_gate_[expert_idx];
+        amx::float_mat_vec<T, false>(m, config_.intermediate_size, gu_k, ba.get(), bb.get(), bc.get(),
+                                     ith, nth, &pl);
+        return;
+      } else if constexpr (kHasSparseGemv) {
         amx::vec_mul_sparse(m, config_.intermediate_size, gu_k, ba, bb, bc, ith, nth, mask);
         return;
       } else {
@@ -148,7 +158,12 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
     int m = m_local_num_[expert_idx];
 
     if (m_sparse_active_) {
-      if constexpr (kHasSparseGemv) {
+      if constexpr (Base::kHasPlanEncoder) {
+        amx::float_mat_vec<T, false>(m, config_.down_n(), config_.down_k(expert_idx),
+                                     down_ba_[expert_idx].get(), down_bb_[expert_idx].get(),
+                                     down_bc_[expert_idx].get(), ith, nth, &m_plan_down_[expert_idx]);
+        return;
+      } else if constexpr (kHasSparseGemv) {
         amx::vec_mul_sparse(m, config_.down_n(), config_.down_k(expert_idx), down_ba_[expert_idx],
                             down_bb_[expert_idx], down_bc_[expert_idx], ith, nth,
                             m_pair_mask_down_[expert_idx].data());

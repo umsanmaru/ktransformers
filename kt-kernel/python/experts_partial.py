@@ -41,6 +41,9 @@ def _k_total(ki, expert_num: int) -> int:
 # 실제 클래스 선택은 여기 — 라이브러리가 자기 클래스 목록을 소유한다)
 _PARTIAL_MOE_CLASSES = {
     "kt_amx_bf16": lambda: kt_kernel_ext.moe.AMXBF16_MOE,
+    # n-contiguous weight layout: prefill은 상속받은 AMX amx_kernel, sparse
+    # decode는 tile_k2의 gemv_slab — 두 경로가 weight 한 벌을 공유한다.
+    "kt_tile_k2_bf16": lambda: kt_kernel_ext.moe.TileK2BF16_MOE,
 }
 
 

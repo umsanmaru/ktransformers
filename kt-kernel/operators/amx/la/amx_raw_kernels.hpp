@@ -6,7 +6,9 @@
 #include <cmath>
 #include <cstdint>
 #include <string>
+#include <type_traits>
 
+#include "act_plan.hpp"
 #include "amx_config.hpp"
 #include "amx_raw_buffers.hpp"
 #include "amx_utils.hpp"
@@ -612,14 +614,37 @@ void float_mat_vec_kgroup(int m, int n, int k, int k_group_size, typename K::Buf
 // GemmKernel224BF16 vec_mul/mat_mul
 // ============================================================================
 
+// 커널이 자기 스케줄을 소유하는가 (KT_MERGE_CONTRACT.md Seam A).
+//
+// tile_k2가 이기는 이유는 소프트웨어 프리페치 **커서**이고, 커서는 전역 소비
+// 순서 위의 lookahead다 — 타일 하나만 받는 microkernel은 "다음에 무엇이
+// 소비될지"를 알 수 없으므로 그 경계로는 표현이 불가능하다. 그래서 그런 커널은
+// 아래 루프 대신 자기 `gemv_slab`을 돌린다. `gemv_slab`이 없는 커널에서는
+// `if constexpr`이 통째로 컴파일아웃되므로 기존 커널의 코드젠은 그대로다.
+template <typename K, typename = void>
+struct owns_schedule : std::false_type {};
+template <typename K>
+struct owns_schedule<K, std::void_t<decltype(&K::gemv_slab)>> : std::true_type {};
+
 // Template function for BF16 mat_mul/vec_mul with AMX or AVX backend
 template <typename K, bool amx_or_avx = true>
 void float_mat_vec(int m, int n, int k, typename K::BufferA* ba, typename K::BufferB* bb, typename K::BufferC* bc,
-                   int ith, int nth) {
+                   int ith, int nth, const ActivationPlan* plan = nullptr) {
   assert(n % K::N_STEP == 0);
   assert(k % K::K_STEP == 0);
 
   auto [n_start, n_end] = K::split_range_n(n, ith, nth);
+
+  if constexpr (owns_schedule<K>::value && !amx_or_avx) {
+    // `!amx_or_avx` 때문에 prefill은 여기 못 들어온다. `m == 1`은 두 번째
+    // 안전망이다 — batched decode가 들어와도 결과가 틀리는 대신 기존 루프로
+    // 간다. plan이 없으면(마스킹 없는 호출) 역시 기존 루프다.
+    if (m == 1 && plan != nullptr) {
+      if (n_start < n_end) K::gemv_slab(1, n, k, n_start, n_end, ba, bb, bc, plan);
+      return;
+    }
+  }
+  (void)plan;
 
   for (int k_block_begin = 0; k_block_begin < k; k_block_begin += K::K_BLOCK) {
     for (int m_begin = 0; m_begin < m; m_begin += K::M_STEP) {
