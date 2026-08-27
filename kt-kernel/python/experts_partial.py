@@ -186,6 +186,20 @@ class PartialMoEWrapper:
     # pinned·주소고정이어야 하며 값은 step마다 in-place 갱신 (계약 ④).
     # weights_ptr: fp32 [qlen][k] 라우터 가중 pinned. 0 = dense.
     # sparse는 decode 전용이므로 qlen != 1에 주면 C++가 즉사시킨다.
+    def set_node_gpu_experts_mask(self, node: int, mask: "torch.Tensor | None") -> None:
+        """노드 인스턴스별 expert skip 마스크 (uint8 [E], pinned 권장; C++가 매 호출 읽으므로
+        호출자가 참조를 유지해야 한다). None = 마스크 해제."""
+        if self._moe is None:
+            raise RuntimeError("weights not loaded")
+        self._moe.set_node_gpu_experts_mask(int(node), 0 if mask is None else mask.data_ptr())
+
+    def cold_slab_views(self) -> list:
+        """(node, proj)별 packed B slab 기술자 — sglang prism의 cold GPU 읽기용.
+        load_weights_from_tensors 이후에만 유효하다."""
+        if self._moe is None:
+            raise RuntimeError("weights not loaded")
+        return self._moe.cold_slab_views()
+
     def submit_forward_gateup(self, qlen_ptr: int, k: int, expert_ids_ptr: int,
                               x_ptr: int, out_ptr: int, cuda_stream: Optional[int] = None,
                               weights_ptr: int = 0) -> None:

@@ -546,6 +546,29 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
     moe_cls.def("forward_down_partial_task", &MoeBindings::DownPartialBindings::cpuinfer_interface,
                 py::arg("qlen"), py::arg("k"), py::arg("expert_ids"), py::arg("act"), py::arg("out"),
                 py::arg("weights") = 0);
+    // Prism cold GPU view — packed B slab 기술자 (node, proj)별. sglang prism이
+    // cudaHostRegister 후 grouped GEMM(cold layout 변형)으로 제자리 읽는다.
+    moe_cls.def("set_node_gpu_experts_mask", &MoeClass::set_node_gpu_experts_mask, py::arg("node"),
+                py::arg("mask_ptr"));
+    moe_cls.def("cold_slab_views", [](MoeClass& self) {
+      py::list out;
+      for (const auto& v : self.cold_slab_views()) {
+        py::dict d;
+        d["node"] = v.node;
+        d["proj"] = v.proj;
+        d["ptr"] = v.ptr;
+        d["bytes"] = v.bytes;
+        d["expert_off"] = v.expert_off;
+        d["n"] = v.n;
+        d["k"] = v.k;
+        d["n_step"] = v.n_step;
+        d["k_step"] = v.k_step;
+        d["n_block"] = v.n_block;
+        d["k_block"] = v.k_block;
+        out.append(d);
+      }
+      return out;
+    });
   }
 
   // Bind write_weight_scale_to_buffer_task for MoE types that support it
@@ -639,6 +662,7 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def("sync_with_cuda_stream", &CPUInfer::sync_with_cuda_stream, py::arg("user_cuda_stream"),
            py::arg("allow_n_pending") = 0)
       .def("submit_with_cuda_stream", &CPUInfer::submit_with_cuda_stream)
+      .def("signal_task", &CPUInfer::signal_task, py::arg("flag_ptr"), py::arg("value"))
 #endif
       ;
 

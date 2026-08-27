@@ -37,6 +37,46 @@
 #include "la/amx.hpp"
 #include "llama.cpp/ggml.h"
 
+// Prism partial prefill 단계 타이머 — env KT_PARTIAL_TIMING=1 이면 호출마다
+// 단계별 ms를 stderr에 찍는다 (진단용, 기본 꺼짐 — 비용은 분기 하나).
+struct PartialTimer {
+  static bool enabled() {
+    static const bool on = [] { const char* e = getenv("KT_PARTIAL_TIMING"); return e && e[0] == '1'; }();
+    return on;
+  }
+  const char* phase; int part; int qlen;
+  std::chrono::steady_clock::time_point t0, last;
+  std::string line;
+  PartialTimer(const char* ph, int p, int q) : phase(ph), part(p), qlen(q) {
+    if (enabled()) { t0 = last = std::chrono::steady_clock::now(); }
+  }
+  void lap(const char* name) {
+    if (!enabled()) return;
+    auto now = std::chrono::steady_clock::now();
+    char buf[64];
+    snprintf(buf, sizeof(buf), " %s %.2f", name, std::chrono::duration<double, std::milli>(now - last).count());
+    line += buf; last = now;
+  }
+  ~PartialTimer() {
+    if (!enabled()) return;
+    auto now = std::chrono::steady_clock::now();
+    fprintf(stderr, "[partial %s tp%d qlen=%d] total %.2f ms:%s\n", phase, part, qlen,
+            std::chrono::duration<double, std::milli>(now - t0).count(), line.c_str());
+  }
+};
+
+// Prism cold GPU view — 한 (numa node, proj)의 packed B slab 기술자.
+struct PrismColdSlabView {
+  int node = 0;
+  int proj = 0;                     // 0=gate, 1=up, 2=down
+  uintptr_t ptr = 0;                // 페이지 정렬 slab 시작
+  size_t bytes = 0;                 // 페이지 올림된 slab 크기
+  std::vector<size_t> expert_off;   // [E+1] 바이트 오프셋 (expert 블록 시작)
+  int n = 0;                        // 이 노드의 N 행 수 (packed 논리 B의 n)
+  std::vector<int> k;               // [E] expert별 K (packed = 타일 올림된 값)
+  int n_step = 0, k_step = 0, n_block = 0, k_block = 0;
+};
+
 template <class T, class Derived>
 class AMX_MOE_BASE {
  public:
@@ -95,6 +135,60 @@ class AMX_MOE_BASE {
   std::vector<std::shared_ptr<typename T::BufferC>> up_bc_;
   std::vector<std::shared_ptr<typename T::BufferA>> down_ba_;
   std::vector<std::shared_ptr<typename T::BufferB>> down_bb_;
+  // proj(0=gate,1=up,2=down)별 packed B slab — expert 블록은 64 B 정렬로 이어진다.
+  void* cold_slab_[3] = {nullptr, nullptr, nullptr};
+  size_t cold_slab_bytes_[3] = {0, 0, 0};
+  std::vector<size_t> cold_slab_off_[3];  // [E+1] 바이트 오프셋
+
+  void alloc_cold_slabs() {
+    const size_t E = config_.expert_num;
+    for (int proj = 0; proj < 3; ++proj) {
+      auto& off = cold_slab_off_[proj];
+      off.assign(E + 1, 0);
+      for (size_t i = 0; i < E; ++i) {
+        size_t bytes = proj == 0   ? buffer_b_required_size(config_.intermediate_size, config_.gate_k(i))
+                       : proj == 1 ? buffer_b_required_size(config_.intermediate_size, config_.up_k(i))
+                                   : buffer_b_required_size(config_.down_n(), config_.down_k(i));
+        off[i + 1] = off[i] + ((bytes + 63) / 64) * 64;
+      }
+      size_t total = ((off.back() + 4095) / 4096) * 4096;
+      if (total == 0) total = 4096;
+      cold_slab_[proj] = std::aligned_alloc(4096, total);
+      if (cold_slab_[proj] == nullptr) throw std::runtime_error("cold slab allocation failed");
+      cold_slab_bytes_[proj] = total;
+    }
+  }
+  void* cold_slab_ptr(int proj, size_t expert) const {
+    return static_cast<char*>(cold_slab_[proj]) + cold_slab_off_[proj][expert];
+  }
+
+ public:
+  // Prism cold hybrid: 이 노드 인스턴스만의 expert skip 마스크 (TP 공용 포인터 대신).
+  // 마스크가 1인 expert는 이 노드가 계산하지 않고 partial 행을 0으로 채운다.
+  void set_gpu_experts_mask(const uint8_t* mask) { config_.gpu_experts_mask = const_cast<uint8_t*>(mask); }
+
+ public:
+  // Prism cold GPU view (sglang prism이 cudaHostRegister + grouped GEMM으로 소비).
+  // 레이아웃은 T::BufferB의 packed 6D (n_block → k_block → n_step → k_step → tile).
+  PrismColdSlabView cold_slab_view(int proj) const {
+    PrismColdSlabView v;
+    v.node = tp_part_idx;
+    v.proj = proj;
+    v.ptr = reinterpret_cast<uintptr_t>(cold_slab_[proj]);
+    v.bytes = cold_slab_bytes_[proj];
+    v.expert_off = cold_slab_off_[proj];
+    v.n = proj == 2 ? config_.down_n() : config_.intermediate_size;
+    v.k.resize(config_.expert_num);
+    for (size_t i = 0; i < config_.expert_num; ++i)
+      v.k[i] = proj == 0 ? config_.gate_k(i) : proj == 1 ? config_.up_k(i) : config_.down_k(i);
+    v.n_step = T::N_STEP;
+    v.k_step = T::K_STEP;
+    v.n_block = T::N_BLOCK;
+    v.k_block = T::K_BLOCK;
+    return v;
+  }
+
+ public:
   std::vector<std::shared_ptr<typename T::BufferC>> down_bc_;
 
   size_t pool_count_ = 0;
@@ -167,7 +261,7 @@ class AMX_MOE_BASE {
       if (pg.gateup_n.rows != config_.intermediate_size) {
         throw std::runtime_error("partial: node gateup_n.rows != node intermediate_size");
       }
-      if (pg.down_n.rows <= 0 || pg.down_n.offset < 0 ||
+      if (pg.down_n.rows < 0 || pg.down_n.offset < 0 ||  // rows == 0: 이 노드는 down 열이 없다 (warm-kt 원격 노드)
           pg.down_n.offset + pg.down_n.rows > config_.hidden_size) {
         throw std::runtime_error("partial: node down_n shard out of hidden range");
       }
@@ -234,6 +328,7 @@ class AMX_MOE_BASE {
     // Prism partial: contraction(K) 축 치수는 접근자를 통해 읽는다 —
     // 기하 필드가 0(기본)이면 full 치수를 돌려주므로 기존 동작과 동일.
     // (gate/up의 K = gateup_k(), down의 K = down_k(); N 축은 불변)
+    alloc_cold_slabs();
     for (size_t i = 0; i < config_.expert_num; i++) {
       gate_up_ba_.push_back(make_buffer_a(config_.max_len, config_.gate_k(i), nullptr));
       if (dual_pack_) {
@@ -244,16 +339,15 @@ class AMX_MOE_BASE {
       down_ba_.push_back(make_buffer_a(config_.max_len, config_.down_k(i), nullptr));
       down_bc_.push_back(make_buffer_c(config_.max_len, config_.down_n(), nullptr));
 
-      void* gate_bb_ptr =
-          std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.gate_k(i)));
-      gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.gate_k(i), gate_bb_ptr));
-
-      void* up_bb_ptr =
-          std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.up_k(i)));
-      up_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.up_k(i), up_bb_ptr));
-
-      void* down_bb_ptr = std::aligned_alloc(64, buffer_b_required_size(config_.down_n(), config_.down_k(i)));
-      down_bb_.push_back(make_buffer_b(config_.down_n(), config_.down_k(i), down_bb_ptr));
+      // expert B 버퍼는 proj별 **slab 하나**에 연속 배치한다 (아래 alloc_cold_slabs).
+      // 이유는 Prism의 cold GPU 읽기다 (prism-partial-entrypoints.md §14): GPU가
+      // 이 packed 버퍼를 UVA로 제자리 읽으려면 cudaHostRegister를 해야 하는데,
+      // expert마다 따로 aligned_alloc하면 인접 버퍼가 페이지를 공유해 등록이
+      // 겹친다. slab은 페이지 정렬이고 (node, proj)당 1회 등록으로 끝난다.
+      gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.gate_k(i),
+                                       cold_slab_ptr(0, i)));
+      up_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.up_k(i), cold_slab_ptr(1, i)));
+      down_bb_.push_back(make_buffer_b(config_.down_n(), config_.down_k(i), cold_slab_ptr(2, i)));
     }
     // TODO: need update to all *.hpp
     // (config_.expert_num * T::M_STEP) in pool_count_ is to ensure padding for each experts.
@@ -343,14 +437,20 @@ class AMX_MOE_BASE {
     }
     // prefill: 토큰별 마스크는 B 재사용을 깨서 이득이 없다 (prefill-dense).
     m_sparse_active_ = false;
+    PartialTimer tm("gateup", tp_part_idx, qlen);
     int activated_expert = prepare_prefill_routing(qlen, k, expert_ids);
     if (activated_expert == 0) {
       return;
     }
+    tm.lap("prep");
     carve_gateup_prefill();
+    tm.lap("carve");
     gather_and_pack_gateup_prefill(qlen, k, expert_ids, (const ggml_bf16_t*)input, activated_expert);
+    tm.lap("pack");
     run_gateup_stage(activated_expert, qlen);
+    tm.lap("gemm");
     export_gateup_partial(qlen, k, expert_ids, (ggml_bf16_t*)out);
+    tm.lap("export");
   }
 
  private:
@@ -923,19 +1023,43 @@ class AMX_MOE_BASE {
       throw std::runtime_error("forward_gateup_partial: node shard exceeds n_total");
     }
     const size_t row_elems = 2 * n_total;
-    for (int m = 0; m < qlen; m++) {
+    // 토큰 블록 단위로 subpool 전체가 복사한다. 단일 스레드 루프였을 때 prefill
+    // M=2688에서 44 MB에 6.4 ms(down은 88 MB에 14.5 ms — 층당 21 ms, 전체의 1/3)가
+    // 여기 있었다 (2026-08-27 KT_PARTIAL_TIMING 실측). decode(qlen==1)는 블록 하나.
+    export_rows_parallel(qlen, [&](int m) {
       for (int j = 0; j < k; j++) {
         int64_t e = expert_ids[m * k + j];
+        ggml_bf16_t* dst = out + ((size_t)m * k + j) * row_elems;
         if (config_.should_skip_expert(e)) {
+          // 이 expert는 다른 소비자(GPU cold hybrid)가 계산한다 — 우리 열 구간을
+          // 0으로 채워 rejoin 합에서 무해하게 한다 (staging은 재사용 버퍼라 stale).
+          std::memset(dst + n_off, 0, inter * sizeof(ggml_bf16_t));
+          std::memset(dst + n_total + n_off, 0, inter * sizeof(ggml_bf16_t));
           continue;
         }
-        ggml_bf16_t* dst = out + ((size_t)m * k + j) * row_elems;
         const size_t pos = (size_t)m_local_pos_[m][j];  // expert 그룹 내 이 토큰의 행
         std::memcpy(dst + n_off, m_local_gate_output_ptr_[e] + pos * inter, inter * sizeof(ggml_bf16_t));
         std::memcpy(dst + n_total + n_off, m_local_up_output_ptr_[e] + pos * inter,
                     inter * sizeof(ggml_bf16_t));
       }
+    });
+  }
+
+  // export 공통: 토큰 [0, qlen)을 블록으로 나눠 subpool에 뿌린다. 블록 하나면
+  // (decode) 호출 스레드가 직접 돈다 — work-stealing 진입 고정비를 피한다.
+  template <typename Fn>
+  void export_rows_parallel(int qlen, Fn&& per_token) {
+    constexpr int kBlock = 16;
+    const int nblocks = (qlen + kBlock - 1) / kBlock;
+    if (nblocks <= 1) {
+      for (int m = 0; m < qlen; m++) per_token(m);
+      return;
     }
+    auto pool = config_.pool->get_subpool(tp_part_idx);
+    pool->do_work_stealing_job(nblocks, [&](int b) {
+      const int m_end = std::min(qlen, (b + 1) * kBlock);
+      for (int m = b * kBlock; m < m_end; m++) per_token(m);
+    });
   }
 
  public:
@@ -964,14 +1088,20 @@ class AMX_MOE_BASE {
       return;
     }
     m_sparse_active_ = false;  // prefill-dense
+    PartialTimer tm("down", tp_part_idx, qlen);
     int activated_expert = prepare_prefill_routing(qlen, k, expert_ids);
     if (activated_expert == 0) {
       return;
     }
+    tm.lap("prep");
     carve_down_prefill();
+    tm.lap("carve");
     gather_and_pack_down_prefill(qlen, k, expert_ids, (const ggml_bf16_t*)act, activated_expert);
+    tm.lap("pack");
     run_down_stage(activated_expert, qlen);
+    tm.lap("gemm");
     export_down_partial(qlen, k, expert_ids, (ggml_bf16_t*)out);
+    tm.lap("export");
   }
 
  private:
@@ -1121,17 +1251,18 @@ class AMX_MOE_BASE {
     if (n_off + rows > h_total) {
       throw std::runtime_error("forward_down_partial: node shard exceeds hidden_size");
     }
-    for (int m = 0; m < qlen; m++) {
+    export_rows_parallel(qlen, [&](int m) {
       for (int j = 0; j < k; j++) {
         int64_t e = expert_ids[m * k + j];
+        ggml_bf16_t* dst = out + ((size_t)m * k + j) * h_total;
         if (config_.should_skip_expert(e)) {
+          std::memset(dst + n_off, 0, rows * sizeof(ggml_bf16_t));  // GPU cold hybrid 몫
           continue;
         }
-        ggml_bf16_t* dst = out + ((size_t)m * k + j) * h_total;
         const size_t pos = (size_t)m_local_pos_[m][j];
         std::memcpy(dst + n_off, m_local_down_output_ptr_[e] + pos * rows, rows * sizeof(ggml_bf16_t));
       }
-    }
+    });
   }
 
  public:
@@ -1148,6 +1279,7 @@ class AMX_MOE_BASE {
   void forward_prefill(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input,
                        void* output) {
     auto pool = config_.pool->get_subpool(tp_part_idx);
+    PartialTimer tm("native", tp_part_idx, qlen);
 #ifdef FORWARD_TIME_PROFILE
     auto start_time = std::chrono::high_resolution_clock::now();
     auto last = start_time;
@@ -1241,6 +1373,7 @@ class AMX_MOE_BASE {
     assert(used_pool_bytes_ba_down <= down_ba_pool_bytes_);
     assert(used_pool_bytes_bc_down <= down_bc_pool_bytes_);
 
+    tm.lap("prep");
 #ifdef FORWARD_TIME_PROFILE
     {
       auto now_time = std::chrono::high_resolution_clock::now();
@@ -1269,6 +1402,7 @@ class AMX_MOE_BASE {
       }
     });
 
+    tm.lap("cpy_input");
 #ifdef FORWARD_TIME_PROFILE
     {
       auto now_time = std::chrono::high_resolution_clock::now();
@@ -1282,6 +1416,7 @@ class AMX_MOE_BASE {
       gate_up_ba_[expert_idx]->from_mat(m_local_num_[expert_idx], m_local_input_ptr_[expert_idx], 0, 1);
     });
 
+    tm.lap("packA");
 #ifdef FORWARD_TIME_PROFILE
     {
       auto now_time = std::chrono::high_resolution_clock::now();
@@ -1308,6 +1443,7 @@ class AMX_MOE_BASE {
         },
         nullptr);
 
+    tm.lap("gateup_gemm");
 #ifdef FORWARD_TIME_PROFILE
     {
       auto now_time = std::chrono::high_resolution_clock::now();
@@ -1318,6 +1454,7 @@ class AMX_MOE_BASE {
 
     apply_activation(activated_expert, nth, qlen);
 
+    tm.lap("act");
 #ifdef FORWARD_TIME_PROFILE
     {
       auto now_time = std::chrono::high_resolution_clock::now();
@@ -1334,6 +1471,7 @@ class AMX_MOE_BASE {
         },
         nullptr);
 
+    tm.lap("packA_down");
 #ifdef FORWARD_TIME_PROFILE
     {
       auto now_time = std::chrono::high_resolution_clock::now();
@@ -1353,6 +1491,7 @@ class AMX_MOE_BASE {
         },
         nullptr);
 
+    tm.lap("down_gemm");
 #ifdef FORWARD_TIME_PROFILE
     {
       auto now_time = std::chrono::high_resolution_clock::now();
@@ -1386,6 +1525,7 @@ class AMX_MOE_BASE {
         },
         nullptr);
 
+    tm.lap("weight_sum");
 #ifdef FORWARD_TIME_PROFILE
     {
       auto now_time = std::chrono::high_resolution_clock::now();

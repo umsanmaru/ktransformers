@@ -419,3 +419,21 @@ shift/and로 x0·x1, a_sq 두 zmm을 even/odd `permutex2var`로 a0·a1, c 16 fp3
 재결합을 막아 intrinsic 하나 = IEEE 연산 하나로 남긴다. 그래서 골든이 비트 동일하다.
 AVX-512가 없으면 같은 순서의 스칼라 폴백.
 
+
+## 14. cold GPU view — packed B slab의 GPU 제자리 읽기 (2026-08-27)
+
+sglang prism의 prefill 3단계(TODO.md "grouped GEMM prefill")가 요구한 kt 측 변경 둘:
+
+- `AMX_MOE_BASE::alloc_cold_slabs()` — expert B 버퍼(gate/up/down)를 **proj별 slab
+  하나**(페이지 정렬, expert 블록은 64 B 정렬로 이어짐)에 배치한다. 이전의 expert별
+  `aligned_alloc(64)`은 인접 버퍼가 페이지를 공유해 `cudaHostRegister`가 겹칠 수
+  있었다. 레이아웃(`BufferBBF16Impl` packed 6D)과 pack 코드는 무변경 — 바뀐 것은
+  버퍼의 **주소**만이다.
+- `cold_slab_view(proj)` / `TP_MOE<AMX_BF16_MOE_TP>::cold_slab_views()` /
+  binding `cold_slab_views()` — (node, proj)별 `{ptr, bytes, expert_off[E+1], n,
+  k[E], n_step, k_step, n_block, k_block}`. sglang `cold_gpu.py`가 이것을
+  host-register하고 grouped GEMM의 COLD 로더(`prism_grouped.cuh`, 타일 주소식은
+  `pack_block`을 그대로 옮긴 것)가 읽는다. 검증은 sglang 쪽 — 합성 pack 재현 대비
+  비트일치, 실제 kt slab 대비 CPU cold 출력과 rel 8e-5.
+- 수명: slab은 인스턴스와 함께 산다(해제 없음 — 기존 expert 버퍼도 해제되지 않았다).
+  GPU 등록은 프로세스 수명.

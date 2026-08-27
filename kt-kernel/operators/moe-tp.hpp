@@ -136,7 +136,9 @@ class TP_MOE_Common : public MoE_Interface {
           }
           int sum = 0;
           for (int i = 0; i < tp_count; i++) {
-            if (rows[i] <= 0 || off[i] < 0 || off[i] + rows[i] > full) {
+            // rows == 0 허용: 그 노드 인스턴스는 이 proj의 열을 갖지 않는다 (Prism warm slab을
+            // GPU-local 노드에만 두는 구성). 버퍼/작업 수가 0으로 떨어지고 export는 0열을 쓴다.
+            if (rows[i] < 0 || off[i] < 0 || off[i] + rows[i] > full) {
               throw std::runtime_error(std::string("partial shard table out of range: ") + name);
             }
             sum += rows[i];

@@ -540,6 +540,22 @@ class TP_MOE<AMX_BF16_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_BF16_MOE_TP
   using Base = TP_MOE<AMX_MOE_BASE<K, AMX_BF16_MOE_TP<K>>>;
   using Base::Base;
 
+  // Prism cold hybrid: 노드별 skip 마스크 (nullptr = skip 없음).
+  void set_node_gpu_experts_mask(int node, uintptr_t mask_ptr) {
+    if (node < 0 || node >= this->tp_count || !this->tps[node]) throw std::runtime_error("bad node index");
+    this->tps[node]->set_gpu_experts_mask(reinterpret_cast<const uint8_t*>(mask_ptr));
+  }
+
+  // Prism cold GPU view: (node, proj) 전부. load_weights 뒤에 호출해야 내용이 유효하다.
+  std::vector<PrismColdSlabView> cold_slab_views() const {
+    std::vector<PrismColdSlabView> out;
+    for (int i = 0; i < this->tp_count; ++i) {
+      if (!this->tps[i]) continue;
+      for (int proj = 0; proj < 3; ++proj) out.push_back(this->tps[i]->cold_slab_view(proj));
+    }
+    return out;
+  }
+
   void load_weights() override {
     auto& config = this->config;
     auto& tps = this->tps;
