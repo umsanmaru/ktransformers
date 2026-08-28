@@ -44,7 +44,19 @@ _PARTIAL_MOE_CLASSES = {
     # n-contiguous weight layout: prefill은 상속받은 AMX amx_kernel, sparse
     # decode는 tile_k2의 gemv_slab — 두 경로가 weight 한 벌을 공유한다.
     "kt_tile_k2_bf16": lambda: kt_kernel_ext.moe.TileK2BF16_MOE,
+    # MXFP4 g32 (e2m1 nibble 행 [N, k/2] + bf16 배율 [N, k/32]) — dense 전용 (sparse plan 거절).
+    # 저장은 kt BufferBInt4KGroupImpl(행우선 nibble + fp32 배율)이고 GPU cold 읽기는 그 레이아웃을
+    # 제자리 해석한다 (sglang prism_grouped_mxfp4.cuh KT_FP4 로더).
+    "kt_amx_fp4": lambda: kt_kernel_ext.moe.AMXFP4_KGroup_MOE,
 }
+
+# 커널 키 → (weight dtype, 원소당 바이트 분모, 배율 dtype 또는 None)
+_WEIGHT_FORMAT = {
+    "kt_amx_bf16": (torch.bfloat16, 1, None),
+    "kt_tile_k2_bf16": (torch.bfloat16, 1, None),
+    "kt_amx_fp4": (torch.uint8, 2, torch.bfloat16),
+}
+FP4_GROUP_SIZE = 32
 
 
 class PartialMoEWrapper:
@@ -61,6 +73,7 @@ class PartialMoEWrapper:
             raise ValueError("PartialMoEWrapper requires config.partial.enabled")
         self._config = config
         self._cpuinfer = cpuinfer
+        self._kernel_key = kernel_key
         self._moe_class = _PARTIAL_MOE_CLASSES[kernel_key]()
         self._moe = None
         self._sparsity_tables = None  # 설치되면 wrapper 수명 내내 보관
@@ -73,8 +86,14 @@ class PartialMoEWrapper:
         down_proj: torch.Tensor,  # bf16 [E, hidden, down_k]
         physical_to_logical_map_cpu: Optional[torch.Tensor] = None,
         sparsity_tables: Optional[dict] = None,
+        gate_scale: Optional[torch.Tensor] = None,  # kt_amx_fp4: bf16 [E·inter·gateup_k/32] (2^e)
+        up_scale: Optional[torch.Tensor] = None,
+        down_scale: Optional[torch.Tensor] = None,
     ) -> None:
         """sparsity_tables: 주면 sparse decode가 켜진다 (없으면 dense).
+
+        kt_amx_fp4 키면 weight는 uint8 nibble(원소 2개/바이트)이고 배율 셋(bf16, 32-블록당 1)이
+        필수다 — C++가 bf16 → fp32로 변환해 BufferB.d에 넣는다.
 
         키 9개 전부 필요하고 전부 fp32 contiguous CPU여야 한다:
           gate_wn_sq/up_wn_sq       [E, gateup_k]    = wn^2
@@ -91,34 +110,46 @@ class PartialMoEWrapper:
         # 원소 수로 검증한다 (shape가 아니라): 밴드형은 [E, N, rows]지만
         # 인덱스형은 expert 블록 [N, k(e)]를 이어 붙인 flat이라 rank가 다르다.
         # 두 경우 모두 "N × Σₑ k(e)"라는 하나의 불변식으로 덮인다.
+        w_dtype, w_div, s_dtype = _WEIGHT_FORMAT[self._kernel_key]
         expect = {
             "gate": cfg.intermediate_size * _k_total(cfg.partial.gate, cfg.expert_num),
             "up": cfg.intermediate_size * _k_total(cfg.partial.up, cfg.expert_num),
             "down": cfg.hidden_size * _k_total(cfg.partial.down, cfg.expert_num),
         }
-        for name, t, shape in (
-            ("gate", gate_proj, expect["gate"]),
-            ("up", up_proj, expect["up"]),
-            ("down", down_proj, expect["down"]),
-        ):
-            if (t.dtype != torch.bfloat16 or t.numel() != shape
+
+        def _check(name, t, numel, dtype):
+            if (t is None or t.dtype != dtype or t.numel() != numel
                     or not t.is_contiguous() or t.device.type != "cpu"):
                 # device 검증 필수: CUDA 텐서의 data_ptr()는 device 주소라
                 # C++ host memcpy가 그대로 segfault한다 (조용한 죽음 방지)
                 raise ValueError(
-                    f"{name}_proj must be contiguous CPU bf16 {shape}, got "
-                    f"{t.dtype} {tuple(t.shape)} device={t.device} "
-                    f"contiguous={t.is_contiguous()}"
+                    f"{name} must be contiguous CPU {dtype} with {numel} elements, got "
+                    f"{None if t is None else (t.dtype, tuple(t.shape), t.device, t.is_contiguous())}"
                 )
+
+        for name, t in (("gate_proj", gate_proj), ("up_proj", up_proj), ("down_proj", down_proj)):
+            _check(name, t, expect[name.split("_")[0]] // w_div, w_dtype)
+        scales = (gate_scale, up_scale, down_scale)
+        if s_dtype is not None:
+            for name, t in zip(("gate_scale", "up_scale", "down_scale"), scales):
+                _check(name, t, expect[name.split("_")[0]] // FP4_GROUP_SIZE, s_dtype)
+            cfg.quant_config.group_size = FP4_GROUP_SIZE
+            cfg.quant_config.zero_point = False
+        elif any(t is not None for t in scales):
+            raise ValueError(f"{self._kernel_key} takes no scale tensors")
         if physical_to_logical_map_cpu is None:
             physical_to_logical_map_cpu = torch.arange(cfg.expert_num, dtype=torch.int64)
         phys_map = physical_to_logical_map_cpu.to(dtype=torch.int64, device="cpu").contiguous()
 
         # pack이 읽는 동안 생존 보장 (계약 ③ 수명 규칙)
-        self._pending = (gate_proj, up_proj, down_proj, phys_map)
+        self._pending = (gate_proj, up_proj, down_proj, phys_map) + scales
         cfg.gate_proj = gate_proj.data_ptr()
         cfg.up_proj = up_proj.data_ptr()
         cfg.down_proj = down_proj.data_ptr()
+        if s_dtype is not None:
+            cfg.gate_scale = gate_scale.data_ptr()
+            cfg.up_scale = up_scale.data_ptr()
+            cfg.down_scale = down_scale.data_ptr()
 
         if sparsity_tables is not None:
             self._install_sparsity(cfg, sparsity_tables)

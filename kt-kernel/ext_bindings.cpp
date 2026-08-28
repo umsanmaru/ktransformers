@@ -1042,7 +1042,9 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
                                                                                     "TileK2BF16_MOE");
   bind_moe_module<AMX_FP8_MOE_TP<amx::GemmKernel224FP8>>(moe_module, "AMXFP8_MOE");
   bind_moe_module<AMX_FP8_PERCHANNEL_MOE_TP<amx::GemmKernel224FP8PerChannel>>(moe_module, "AMXFP8PerChannel_MOE");
-  bind_moe_module<AMX_FP4_MOE_TP<amx::GemmKernel224MXFP4SmallKGroup>>(moe_module, "AMXFP4_KGroup_MOE");
+  // WithPartial: Prism cold 티어(mxfp4, dense) — forward_*_partial + cold_slab_views.
+  bind_moe_module<AMX_FP4_MOE_TP<amx::GemmKernel224MXFP4SmallKGroup>, /*WithPartial=*/true>(moe_module,
+                                                                                            "AMXFP4_KGroup_MOE");
   bind_moe_module<AMX_MXFP8_MOE_TP<amx::GemmKernel224MXFP8SmallKGroup>>(moe_module, "AMXMXFP8_KGroup_MOE");
 #endif
 #if defined(__AVX512BF16__)

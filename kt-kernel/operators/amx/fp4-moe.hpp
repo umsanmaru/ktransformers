@@ -379,6 +379,12 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     if (quant_config.group_size == 0 || quant_config.zero_point) {
       throw std::runtime_error("MXFP4 MoE only supports KGroup FP4");
     }
+    // Prism partial(K-index) 인스턴스: 이 커널은 페어 마스크(plan)를 읽지 않는 dense
+    // 커널이므로 sparse plan은 거절한다 (조용히 dense로 돌면 마스크가 사라진다).
+    if (config_.is_partial() && config_.partial.sparsity.enabled)
+      throw std::runtime_error("AMX_FP4_MOE_TP: sparse (k2wl2) partial plans are not supported — dense only");
+    if (config_.is_partial() && quant_config.group_size != T::K_STEP)
+      throw std::runtime_error("AMX_FP4_MOE_TP partial: group_size must equal K_STEP (32)");
     printf("Creating AMX_FP4_MOE_TP %d at numa %d\n", tp_part_idx, numa_node_of_cpu(sched_getcpu()));
   }
 
@@ -408,10 +414,12 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     auto& bb = do_up ? up_bb_[expert_idx] : gate_bb_[expert_idx];
     auto& bc = do_up ? up_bc_[expert_idx] : gate_bc_[expert_idx];
 
+    // K 치수는 접근자 경유 — Prism partial 인스턴스면 expert별 K-인덱스 길이, 아니면 full.
+    const int gu_k = do_up ? config_.up_k(expert_idx) : config_.gate_k(expert_idx);
     if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
-      amx::mat_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth);
+      amx::mat_mul_kgroup(m, config_.intermediate_size, gu_k, group_size, ba, bb, bc, ith, nth);
     } else {
-      amx::vec_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth);
+      amx::vec_mul_kgroup(m, config_.intermediate_size, gu_k, group_size, ba, bb, bc, ith, nth);
     }
   }
 
@@ -419,11 +427,12 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     auto& group_size = config_.quant_config.group_size;
     int m = m_local_num_[expert_idx];
 
+    const int dn_n = config_.down_n(), dn_k = config_.down_k(expert_idx);
     if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
-      amx::mat_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
+      amx::mat_mul_kgroup(m, dn_n, dn_k, group_size, down_ba_[expert_idx],
                           down_bb_[expert_idx], down_bc_[expert_idx], ith, nth);
     } else {
-      amx::vec_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
+      amx::vec_mul_kgroup(m, dn_n, dn_k, group_size, down_ba_[expert_idx],
                           down_bb_[expert_idx], down_bc_[expert_idx], ith, nth);
     }
   }
@@ -444,12 +453,14 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
           uint64_t expert_idx = task_id / nth;
           uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
           int ith = task_id % nth;
+          // expert 블록 시작 = N × row_base(e) 원소 (비partial: e·H, partial: Σ_{e'<e} k(e')).
           gate_bb_[expert_idx]->from_raw_mat(
               (uint8_t*)config_.gate_proj +
-                  ((logical_expert_id * config_.intermediate_size * config_.hidden_size) >> 1),
+                  (((size_t)config_.intermediate_size * (size_t)config_.gate_row_base(logical_expert_id)) >> 1),
               ith, nth);
           up_bb_[expert_idx]->from_raw_mat(
-              (uint8_t*)config_.up_proj + ((logical_expert_id * config_.intermediate_size * config_.hidden_size) >> 1),
+              (uint8_t*)config_.up_proj +
+                  (((size_t)config_.intermediate_size * (size_t)config_.up_row_base(logical_expert_id)) >> 1),
               ith, nth);
         },
         nullptr);
@@ -463,7 +474,7 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
           int ith = task_id % nth;
           down_bb_[expert_idx]->from_raw_mat(
               (uint8_t*)config_.down_proj +
-                  ((logical_expert_id * config_.hidden_size * config_.intermediate_size) >> 1),
+                  (((size_t)config_.down_n() * (size_t)config_.down_row_base(logical_expert_id)) >> 1),
               ith, nth);
         },
         nullptr);
@@ -473,13 +484,18 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
         [this, physical_to_logical_map](int task_id) {
           uint64_t expert_idx = task_id;
           uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
-          size_t scale_elem_count = (config_.hidden_size * config_.intermediate_size) / config_.quant_config.group_size;
+          const size_t gs = config_.quant_config.group_size;
+          const size_t I = config_.intermediate_size, DN = config_.down_n();
+          // 배율 블록 수 = N × k(e) / group_size; 시작 = N × row_base(e) / group_size.
           convert_or_copy(gate_bb_[expert_idx]->d,
-                          (ggml_bf16_t*)config_.gate_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
+                          (ggml_bf16_t*)config_.gate_scale + (I * (size_t)config_.gate_row_base(logical_expert_id)) / gs,
+                          I * (size_t)config_.gate_k(logical_expert_id) / gs);
           convert_or_copy(up_bb_[expert_idx]->d,
-                          (ggml_bf16_t*)config_.up_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
+                          (ggml_bf16_t*)config_.up_scale + (I * (size_t)config_.up_row_base(logical_expert_id)) / gs,
+                          I * (size_t)config_.up_k(logical_expert_id) / gs);
           convert_or_copy(down_bb_[expert_idx]->d,
-                          (ggml_bf16_t*)config_.down_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
+                          (ggml_bf16_t*)config_.down_scale + (DN * (size_t)config_.down_row_base(logical_expert_id)) / gs,
+                          DN * (size_t)config_.down_k(logical_expert_id) / gs);
         },
         nullptr);
   }
@@ -683,6 +699,23 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
   using Base = TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K>>>;
   using Base::Base;
 
+  // Prism cold hybrid: 노드 인스턴스별 expert skip 마스크 (bf16-moe.hpp와 동형).
+  void set_node_gpu_experts_mask(int node, uintptr_t mask_ptr) {
+    if (node < 0 || node >= this->tp_count || !this->tps[node]) throw std::runtime_error("bad node index");
+    this->tps[node]->set_gpu_experts_mask(reinterpret_cast<const uint8_t*>(mask_ptr));
+  }
+
+  // Prism cold GPU view: (node, proj) 전부. 레이아웃은 BufferBInt4KGroupImpl(행우선 nibble +
+  // fp32 배율) — sglang prism_grouped_mxfp4.cuh의 KT_FP4 로더가 해석한다.
+  std::vector<PrismColdSlabView> cold_slab_views() const {
+    std::vector<PrismColdSlabView> out;
+    for (int i = 0; i < this->tp_count; ++i) {
+      if (!this->tps[i]) continue;
+      for (int proj = 0; proj < 3; ++proj) out.push_back(this->tps[i]->cold_slab_view(proj));
+    }
+    return out;
+  }
+
   void load_weights() override {
     auto& config = this->config;
     auto& tps = this->tps;
@@ -699,6 +732,57 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
 
     int& group_size = config.quant_config.group_size;
 
+    if (config.is_partial()) {
+      // Prism partial (K-index, flat expert 블록 [N, k(e)/2] + bf16 배율 [N, k(e)/gs]):
+      // gate/up은 N(inter) 행 shard, down은 N(hidden) 행 shard — 둘 다 연속 블록이라
+      // expert당 memcpy 1회씩이다 (bf16-moe.hpp의 partial 분기와 동형).
+      pool->dispense_backend()->do_numa_job([&, this](int i) {
+        auto& tpc = tps[i]->config_;
+        const size_t I = tpc.intermediate_size, DN = tpc.down_n(), gs = group_size;
+        const size_t g_tot = I * (size_t)tpc.gate_row_base(tpc.expert_num);
+        const size_t u_tot = I * (size_t)tpc.up_row_base(tpc.expert_num);
+        const size_t d_tot = DN * (size_t)tpc.down_row_base(tpc.expert_num);
+        tpc.gate_proj = new uint8_t[g_tot / 2];
+        tpc.up_proj = new uint8_t[u_tot / 2];
+        tpc.down_proj = new uint8_t[d_tot / 2];
+        tpc.gate_scale = new ggml_bf16_t[g_tot / gs];
+        tpc.up_scale = new ggml_bf16_t[u_tot / gs];
+        tpc.down_scale = new ggml_bf16_t[d_tot / gs];
+        const size_t gu_n_off = (size_t)tpc.partial.gateup_n.offset;
+        const size_t dn_n_off = (size_t)tpc.partial.down_n.offset;
+        const size_t I_full = config.intermediate_size, H_full = config.hidden_size;
+        pool->get_subpool(i)->do_work_stealing_job(
+            tpc.expert_num, nullptr,
+            [&](int expert_id_) {
+              const size_t e = expert_map(physical_to_logical_map, expert_id_);
+              const size_t g_k = config.gate_k(e), u_k = config.up_k(e), d_k = config.down_k(e);
+              // 소스(full N) 블록 시작: N_full × row_base(e); shard 행 시작 = n_off × k(e).
+              const uint8_t* g_src = (const uint8_t*)config.gate_proj +
+                                     ((I_full * (size_t)config.gate_row_base(e) + gu_n_off * g_k) >> 1);
+              const uint8_t* u_src = (const uint8_t*)config.up_proj +
+                                     ((I_full * (size_t)config.up_row_base(e) + gu_n_off * u_k) >> 1);
+              const uint8_t* d_src = (const uint8_t*)config.down_proj +
+                                     ((H_full * (size_t)config.down_row_base(e) + dn_n_off * d_k) >> 1);
+              memcpy((uint8_t*)tpc.gate_proj + ((I * (size_t)tpc.gate_row_base(e)) >> 1), g_src, (I * g_k) >> 1);
+              memcpy((uint8_t*)tpc.up_proj + ((I * (size_t)tpc.up_row_base(e)) >> 1), u_src, (I * u_k) >> 1);
+              memcpy((uint8_t*)tpc.down_proj + ((DN * (size_t)tpc.down_row_base(e)) >> 1), d_src, (DN * d_k) >> 1);
+              const ggml_bf16_t* gs_src = (const ggml_bf16_t*)config.gate_scale +
+                                          (I_full * (size_t)config.gate_row_base(e) + gu_n_off * g_k) / gs;
+              const ggml_bf16_t* us_src = (const ggml_bf16_t*)config.up_scale +
+                                          (I_full * (size_t)config.up_row_base(e) + gu_n_off * u_k) / gs;
+              const ggml_bf16_t* ds_src = (const ggml_bf16_t*)config.down_scale +
+                                          (H_full * (size_t)config.down_row_base(e) + dn_n_off * d_k) / gs;
+              memcpy((ggml_bf16_t*)tpc.gate_scale + (I * (size_t)tpc.gate_row_base(e)) / gs, gs_src,
+                     sizeof(ggml_bf16_t) * (I * g_k / gs));
+              memcpy((ggml_bf16_t*)tpc.up_scale + (I * (size_t)tpc.up_row_base(e)) / gs, us_src,
+                     sizeof(ggml_bf16_t) * (I * u_k / gs));
+              memcpy((ggml_bf16_t*)tpc.down_scale + (DN * (size_t)tpc.down_row_base(e)) / gs, ds_src,
+                     sizeof(ggml_bf16_t) * (DN * d_k / gs));
+            },
+            nullptr);
+        printf("TP %d (partial fp4) load weight done.\n", i);
+      });
+    } else
     pool->dispense_backend()->do_numa_job([&, this](int i) {
       auto& tpc = tps[i]->config_;
       size_t weight_elem_count = tpc.intermediate_size * tpc.hidden_size;
