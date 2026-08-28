@@ -10,6 +10,8 @@
 #ifndef CPUINFER_CPUINFER_H
 #define CPUINFER_CPUINFER_H
 
+#include <map>
+#include <mutex>
 #include <atomic>
 #include <condition_variable>
 #include <functional>
@@ -103,19 +105,31 @@ class CPUInfer {
     void (*func)(void*);
     void* args;
   };
+  // 래퍼는 **영구**다: cudaLaunchHostFunc가 CUDA graph에 캡처되면 같은 user-data 포인터로
+  // 재생되므로 첫 실행 뒤 delete하면 두 번째 replay가 use-after-free로 segfault한다
+  // (2026-08-28, Prism decode graph). (func, args) 쌍당 1개를 만들어 캐시한다 — args 자체가
+  // 태스크 객체당 영구 할당이라(ext_bindings *PartialBindings) 캐시 크기는 태스크 수에 묶인다.
   static void host_submit_(void* p) {
     HostSubmitArgs* a = (HostSubmitArgs*)p;
     KT_NVTX_MARK("kt.submit");
     a->func(a->args);
-    delete a;
   }
+  HostSubmitArgs* host_submit_wrapper_(void (*func)(void*), void* args) {
+    std::lock_guard<std::mutex> g(host_submit_mu_);
+    auto key = std::make_pair((intptr_t)func, (intptr_t)args);
+    auto it = host_submit_cache_.find(key);
+    if (it == host_submit_cache_.end()) it = host_submit_cache_.emplace(key, new HostSubmitArgs{func, args}).first;
+    return it->second;
+  }
+  std::mutex host_submit_mu_;
+  std::map<std::pair<intptr_t, intptr_t>, HostSubmitArgs*> host_submit_cache_;
   void submit_with_cuda_stream(intptr_t user_cuda_stream, std::pair<intptr_t, intptr_t> params) {
 #if defined(KTRANSFORMERS_USE_CUDA) || defined(KTRANSFORMERS_USE_CUDA_HOST_CALLBACKS) || \
     defined(KTRANSFORMERS_USE_MUSA) || defined(KTRANSFORMERS_USE_ROCM) || defined(KTRANSFORMERS_USE_MACA)
     void (*func)(void*) = (void (*)(void*))params.first;
     void* args = (void*)params.second;
     *((CPUInfer**)args) = this;
-    HostSubmitArgs* wrapped = new HostSubmitArgs{func, args};
+    HostSubmitArgs* wrapped = host_submit_wrapper_(func, args);
     cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, (cudaHostFn_t)&host_submit_, (void*)wrapped);
 #endif
   }
