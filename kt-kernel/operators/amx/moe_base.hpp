@@ -547,6 +547,24 @@ class AMX_MOE_BASE {
   // 소켓에서는 miss가 하나씩 노출된다 (2026-08-26: prep 잔여 ~17 vs ~55 µs).
   // 태스크가 만질 입력(합쳐 ~16-24 KB, L2에 넉넉히 든다)을 시작 시 한꺼번에
   // 발행해 두면 SQ가 꽉 찬 채로 채워지고, 뒤따르는 루프는 L2에서 돈다.
+  // export 전용: 행을 복사하면서 앞선 캐시라인을 SW 프리페치한다. HW 프리페치가
+  // 꺼진 환경에서 partial export(8× 볼륨의 산개 memcpy)가 라인당 DRAM 지연으로
+  // 직렬화되는 것을 막는다 — 프리페치가 MLP를 소프트웨어로 복원한다. n은 bf16 원소
+  // 수(64B=32원소 배수 가정, export 행은 항상 그렇다). PF_AHEAD는 512B(8라인).
+  static inline void copy_rows_pf(ggml_bf16_t* dst, const ggml_bf16_t* src, size_t n) {
+    constexpr size_t AHEAD = 512;  // bytes
+    const char* s = reinterpret_cast<const char*>(src);
+    char* d = reinterpret_cast<char*>(dst);
+    const size_t bytes = n * sizeof(ggml_bf16_t);
+    size_t i = 0;
+    for (; i + 64 <= bytes; i += 64) {
+      if (i + AHEAD < bytes) _mm_prefetch(s + i + AHEAD, _MM_HINT_T0);
+      avx512_copy_32xbf16(reinterpret_cast<__m512i*>(const_cast<char*>(s + i)),
+                          reinterpret_cast<__m512i*>(d + i));
+    }
+    if (i < bytes) std::memcpy(d + i, s + i, bytes - i);
+  }
+
   static inline void prefetch_bytes(const void* p, size_t bytes) {
     const char* c = reinterpret_cast<const char*>(p);
     const char* end = c + bytes;
@@ -1038,9 +1056,8 @@ class AMX_MOE_BASE {
           continue;
         }
         const size_t pos = (size_t)m_local_pos_[m][j];  // expert 그룹 내 이 토큰의 행
-        std::memcpy(dst + n_off, m_local_gate_output_ptr_[e] + pos * inter, inter * sizeof(ggml_bf16_t));
-        std::memcpy(dst + n_total + n_off, m_local_up_output_ptr_[e] + pos * inter,
-                    inter * sizeof(ggml_bf16_t));
+        copy_rows_pf(dst + n_off, m_local_gate_output_ptr_[e] + pos * inter, inter);
+        copy_rows_pf(dst + n_total + n_off, m_local_up_output_ptr_[e] + pos * inter, inter);
       }
     });
   }
@@ -1260,7 +1277,7 @@ class AMX_MOE_BASE {
           continue;
         }
         const size_t pos = (size_t)m_local_pos_[m][j];
-        std::memcpy(dst + n_off, m_local_down_output_ptr_[e] + pos * rows, rows * sizeof(ggml_bf16_t));
+        copy_rows_pf(dst + n_off, m_local_down_output_ptr_[e] + pos * rows, rows);
       }
     });
   }
