@@ -50,6 +50,7 @@ static const bool _is_plain_ = false;
 #include "operators/amx/la/tile_k2.hpp"          // m==1 sparse decode GEMV over the same layout
 #include "operators/amx/bf16-moe.hpp"            // Native BF16 MoE using CRTP pattern, with fallback for AVX512F
 #include "operators/amx/fp4-moe.hpp"             // MXFP4 MoE: FP4 E2M1 weights × BF16 activations
+#include "operators/amx/tile-mxfp4-moe.hpp"        // MXFP4 tile layout + sparse decode (Prism cold)
 #include "operators/amx/fp8-moe.hpp"             // FP8 MoE requires AVX512 BF16 support, with fallback for AVX512F+BW
 #include "operators/amx/fp8-perchannel-moe.hpp"  // FP8 Per-Channel MoE for GLM-4.7-FP8
 #include "operators/amx/k2-moe.hpp"
@@ -1045,6 +1046,9 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   // WithPartial: Prism cold 티어(mxfp4, dense) — forward_*_partial + cold_slab_views.
   bind_moe_module<AMX_FP4_MOE_TP<amx::GemmKernel224MXFP4SmallKGroup>, /*WithPartial=*/true>(moe_module,
                                                                                             "AMXFP4_KGroup_MOE");
+  // fp4 타일 레이아웃 + 프리페치 커서 sparse decode (cpu-mm tile_k2_mxfp4 포팅). Prism cold 전용.
+  bind_moe_module<TILE_MXFP4_MOE_TP<amx::GemmKernelTileK2MXFP4>, /*WithPartial=*/true>(moe_module,
+                                                                                       "TileK2MXFP4_MOE");
   bind_moe_module<AMX_MXFP8_MOE_TP<amx::GemmKernel224MXFP8SmallKGroup>>(moe_module, "AMXMXFP8_KGroup_MOE");
 #endif
 #if defined(__AVX512BF16__)

@@ -693,33 +693,16 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
 // ============================================================================
 // TP_MOE specialization for AMX_FP4_MOE_TP
 // ============================================================================
-template <typename K>
-class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K>>> {
- public:
-  using Base = TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K>>>;
-  using Base::Base;
+template <class TPM>
+inline void mxfp4_tp_load_weights(TPM& self);
 
-  // Prism cold hybrid: 노드 인스턴스별 expert skip 마스크 (bf16-moe.hpp와 동형).
-  void set_node_gpu_experts_mask(int node, uintptr_t mask_ptr) {
-    if (node < 0 || node >= this->tp_count || !this->tps[node]) throw std::runtime_error("bad node index");
-    this->tps[node]->set_gpu_experts_mask(reinterpret_cast<const uint8_t*>(mask_ptr));
-  }
-
-  // Prism cold GPU view: (node, proj) 전부. 레이아웃은 BufferBInt4KGroupImpl(행우선 nibble +
-  // fp32 배율) — sglang prism_grouped_mxfp4.cuh의 KT_FP4 로더가 해석한다.
-  std::vector<PrismColdSlabView> cold_slab_views() const {
-    std::vector<PrismColdSlabView> out;
-    for (int i = 0; i < this->tp_count; ++i) {
-      if (!this->tps[i]) continue;
-      for (int proj = 0; proj < 3; ++proj) out.push_back(this->tps[i]->cold_slab_view(proj));
-    }
-    return out;
-  }
-
-  void load_weights() override {
-    auto& config = this->config;
-    auto& tps = this->tps;
-    auto& tp_count = this->tp_count;
+// MXFP4 weight staging shared by the fp4 operators (AMX_FP4_MOE_TP, TILE_MXFP4_MOE_TP): full
+// tensors → per-TP N-shard copies → each TP packs (from_raw_mat + scales). `self`는 TP_MOE.
+template <class TPM>
+inline void mxfp4_tp_load_weights(TPM& self) {
+    auto& config = self.config;
+    auto& tps = self.tps;
+    auto& tp_count = self.tp_count;
     auto pool = config.pool;
     const uint64_t* physical_to_logical_map = (const uint64_t*)config.physical_to_logical_map;
 
@@ -736,7 +719,7 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
       // Prism partial (K-index, flat expert 블록 [N, k(e)/2] + bf16 배율 [N, k(e)/gs]):
       // gate/up은 N(inter) 행 shard, down은 N(hidden) 행 shard — 둘 다 연속 블록이라
       // expert당 memcpy 1회씩이다 (bf16-moe.hpp의 partial 분기와 동형).
-      pool->dispense_backend()->do_numa_job([&, this](int i) {
+      pool->dispense_backend()->do_numa_job([&](int i) {
         auto& tpc = tps[i]->config_;
         const size_t I = tpc.intermediate_size, DN = tpc.down_n(), gs = group_size;
         const size_t g_tot = I * (size_t)tpc.gate_row_base(tpc.expert_num);
@@ -783,7 +766,7 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
         printf("TP %d (partial fp4) load weight done.\n", i);
       });
     } else
-    pool->dispense_backend()->do_numa_job([&, this](int i) {
+    pool->dispense_backend()->do_numa_job([&](int i) {
       auto& tpc = tps[i]->config_;
       size_t weight_elem_count = tpc.intermediate_size * tpc.hidden_size;
       size_t scales_elem_count = (tpc.hidden_size / group_size) * tpc.intermediate_size;
@@ -875,9 +858,12 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
       printf("TP %d load weight done.\n", i);
     });
 
-    DO_TPS_LOAD_WEIGHTS(pool);
+    pool->dispense_backend()->do_numa_job([&](int numa_id) {
+      tps[numa_id]->config_.physical_to_logical_map = config.physical_to_logical_map;
+      tps[numa_id]->load_weights();
+    });
 
-    pool->dispense_backend()->do_numa_job([&, this](int i) {
+    pool->dispense_backend()->do_numa_job([&](int i) {
       auto& tpc = tps[i]->config_;
       delete[] (uint8_t*)(tpc.gate_proj);
       delete[] (uint8_t*)(tpc.up_proj);
@@ -887,8 +873,36 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
       delete[] (ggml_bf16_t*)(tpc.down_scale);
     });
 
-    this->weights_loaded = true;
+    self.weights_loaded = true;
   }
+
+
+template <typename K>
+class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K>>> {
+ public:
+  using Base = TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K>>>;
+  using Base::Base;
+  template <class TPM>
+  friend void mxfp4_tp_load_weights(TPM& self);
+
+  // Prism cold hybrid: 노드 인스턴스별 expert skip 마스크 (bf16-moe.hpp와 동형).
+  void set_node_gpu_experts_mask(int node, uintptr_t mask_ptr) {
+    if (node < 0 || node >= this->tp_count || !this->tps[node]) throw std::runtime_error("bad node index");
+    this->tps[node]->set_gpu_experts_mask(reinterpret_cast<const uint8_t*>(mask_ptr));
+  }
+
+  // Prism cold GPU view: (node, proj) 전부. 레이아웃은 BufferBInt4KGroupImpl(행우선 nibble +
+  // fp32 배율) — sglang prism_grouped_mxfp4.cuh의 KT_FP4 로더가 해석한다.
+  std::vector<PrismColdSlabView> cold_slab_views() const {
+    std::vector<PrismColdSlabView> out;
+    for (int i = 0; i < this->tp_count; ++i) {
+      if (!this->tps[i]) continue;
+      for (int proj = 0; proj < 3; ++proj) out.push_back(this->tps[i]->cold_slab_view(proj));
+    }
+    return out;
+  }
+
+  void load_weights() override { mxfp4_tp_load_weights(*this); }
 
   void write_weight_scale_to_buffer(int gpu_tp_count, int expert_id, const std::vector<uintptr_t>& w13_weight_ptrs,
                                     const std::vector<uintptr_t>& w13_scale_ptrs,

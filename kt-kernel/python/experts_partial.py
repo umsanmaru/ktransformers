@@ -48,6 +48,9 @@ _PARTIAL_MOE_CLASSES = {
     # 저장은 kt BufferBInt4KGroupImpl(행우선 nibble + fp32 배율)이고 GPU cold 읽기는 그 레이아웃을
     # 제자리 해석한다 (sglang prism_grouped_mxfp4.cuh KT_FP4 로더).
     "kt_amx_fp4": lambda: kt_kernel_ext.moe.AMXFP4_KGroup_MOE,
+    # MXFP4 타일 레이아웃 + 프리페치 커서 sparse decode (cpu-mm tile_k2_mxfp4 포팅). 노드 N shard는
+    # 256 배수. prefill은 GPU KT_TILE4 로더가 slab을 읽는다.
+    "kt_tile_k2_mxfp4": lambda: kt_kernel_ext.moe.TileK2MXFP4_MOE,
 }
 
 # 커널 키 → (weight dtype, 원소당 바이트 분모, 배율 dtype 또는 None)
@@ -55,6 +58,7 @@ _WEIGHT_FORMAT = {
     "kt_amx_bf16": (torch.bfloat16, 1, None),
     "kt_tile_k2_bf16": (torch.bfloat16, 1, None),
     "kt_amx_fp4": (torch.uint8, 2, torch.bfloat16),
+    "kt_tile_k2_mxfp4": (torch.uint8, 2, torch.bfloat16),
 }
 FP4_GROUP_SIZE = 32
 
