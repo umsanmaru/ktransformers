@@ -51,14 +51,21 @@ _PARTIAL_MOE_CLASSES = {
     # MXFP4 타일 레이아웃 + 프리페치 커서 sparse decode (cpu-mm tile_k2_mxfp4 포팅). 노드 N shard는
     # 256 배수. prefill은 GPU KT_TILE4 로더가 slab을 읽는다.
     "kt_tile_k2_mxfp4": lambda: kt_kernel_ext.moe.TileK2MXFP4_MOE,
+    # FP8 e4m3 타일 레이아웃 + 프리페치 커서 sparse decode (cpu-mm tile_k2_fp8b128 포팅).
+    # 배율은 128×128 블록당 fp32 하나(`scale_inv`, n-major). 노드 N shard 256 배수, K 128 배수.
+    # prefill은 GPU KT_TILE8 로더가 slab을 읽는다.
+    "kt_tile_k2_fp8b128": lambda: kt_kernel_ext.moe.TileK2FP8B128_MOE,
 }
 
-# 커널 키 → (weight dtype, 원소당 바이트 분모, 배율 dtype 또는 None)
+# 커널 키 → (weight dtype, 원소당 바이트 분모, 배율 dtype 또는 None, 배율 원소당 weight 원소 수,
+#            quant group_size). 배율 개수는 "weight 원소 수 / scale_div"다 — mxfp4는 32-k 블록
+# 하나에 배율 1개(행마다)라 32, fp8 블록은 128×128이라 16384다.
 _WEIGHT_FORMAT = {
-    "kt_amx_bf16": (torch.bfloat16, 1, None),
-    "kt_tile_k2_bf16": (torch.bfloat16, 1, None),
-    "kt_amx_fp4": (torch.uint8, 2, torch.bfloat16),
-    "kt_tile_k2_mxfp4": (torch.uint8, 2, torch.bfloat16),
+    "kt_amx_bf16": (torch.bfloat16, 1, None, 1, 0),
+    "kt_tile_k2_bf16": (torch.bfloat16, 1, None, 1, 0),
+    "kt_amx_fp4": (torch.uint8, 2, torch.bfloat16, 32, 32),
+    "kt_tile_k2_mxfp4": (torch.uint8, 2, torch.bfloat16, 32, 32),
+    "kt_tile_k2_fp8b128": (torch.uint8, 1, torch.float32, 128 * 128, 128),
 }
 FP4_GROUP_SIZE = 32
 
@@ -96,8 +103,10 @@ class PartialMoEWrapper:
     ) -> None:
         """sparsity_tables: 주면 sparse decode가 켜진다 (없으면 dense).
 
-        kt_amx_fp4 키면 weight는 uint8 nibble(원소 2개/바이트)이고 배율 셋(bf16, 32-블록당 1)이
-        필수다 — C++가 bf16 → fp32로 변환해 BufferB.d에 넣는다.
+        양자화 키면 배율 셋이 필수다: kt_amx_fp4/kt_tile_k2_mxfp4는 weight가 uint8 nibble
+        (원소 2개/바이트) + 배율 bf16(32-k 블록당 1, C++가 fp32 또는 전치 E8M0으로 변환),
+        kt_tile_k2_fp8b128은 weight가 e4m3 바이트 + 배율 fp32(128×128 블록당 1, n-major
+        `scale_inv`).
 
         키 9개 전부 필요하고 전부 fp32 contiguous CPU여야 한다:
           gate_wn_sq/up_wn_sq       [E, gateup_k]    = wn^2
@@ -114,7 +123,7 @@ class PartialMoEWrapper:
         # 원소 수로 검증한다 (shape가 아니라): 밴드형은 [E, N, rows]지만
         # 인덱스형은 expert 블록 [N, k(e)]를 이어 붙인 flat이라 rank가 다르다.
         # 두 경우 모두 "N × Σₑ k(e)"라는 하나의 불변식으로 덮인다.
-        w_dtype, w_div, s_dtype = _WEIGHT_FORMAT[self._kernel_key]
+        w_dtype, w_div, s_dtype, s_div, group_size = _WEIGHT_FORMAT[self._kernel_key]
         expect = {
             "gate": cfg.intermediate_size * _k_total(cfg.partial.gate, cfg.expert_num),
             "up": cfg.intermediate_size * _k_total(cfg.partial.up, cfg.expert_num),
@@ -136,8 +145,8 @@ class PartialMoEWrapper:
         scales = (gate_scale, up_scale, down_scale)
         if s_dtype is not None:
             for name, t in zip(("gate_scale", "up_scale", "down_scale"), scales):
-                _check(name, t, expect[name.split("_")[0]] // FP4_GROUP_SIZE, s_dtype)
-            cfg.quant_config.group_size = FP4_GROUP_SIZE
+                _check(name, t, expect[name.split("_")[0]] // s_div, s_dtype)
+            cfg.quant_config.group_size = group_size
             cfg.quant_config.zero_point = False
         elif any(t is not None for t in scales):
             raise ValueError(f"{self._kernel_key} takes no scale tensors")
