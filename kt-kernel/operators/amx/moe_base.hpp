@@ -258,6 +258,17 @@ class AMX_MOE_BASE {
       validate_kindex(pg.gate, config_.hidden_size, "gate");
       validate_kindex(pg.up, config_.hidden_size, "up");
       validate_kindex(pg.down, pg.n_total, "down");
+      // gate/up은 한 단계에서 융합되므로 "cold 몫 없음"이 둘에서 같아야 한다 —
+      // 한쪽만 0행이면 그 단계를 건너뛸 수도, 반쪽만 계산할 수도 없다.
+      if (pg.gate.indexed() && pg.up.indexed()) {
+        for (int e = 0; e < config_.expert_num; e++) {
+          if ((pg.gate.k(e) == 0) != (pg.up.k(e) == 0)) {
+            throw std::runtime_error("partial: expert " + std::to_string(e) +
+                                     " has gate/up cold rows only on one side — "
+                                     "both must be empty or both non-empty");
+          }
+        }
+      }
       if (pg.gateup_n.rows != config_.intermediate_size) {
         throw std::runtime_error("partial: node gateup_n.rows != node intermediate_size");
       }
@@ -438,7 +449,7 @@ class AMX_MOE_BASE {
     // prefill: 토큰별 마스크는 B 재사용을 깨서 이득이 없다 (prefill-dense).
     m_sparse_active_ = false;
     PartialTimer tm("gateup", tp_part_idx, qlen);
-    int activated_expert = prepare_prefill_routing(qlen, k, expert_ids);
+    int activated_expert = prepare_prefill_routing(qlen, k, expert_ids, /*down_stage=*/false);
     if (activated_expert == 0) {
       return;
     }
@@ -503,7 +514,9 @@ class AMX_MOE_BASE {
         const int kr = ki.row_off[e + 1] - ki.row_off[e];
         // 패딩은 타일 경계까지의 올림이므로 [kr - K_STEP, kr] 안에 있어야 하고,
         // 페어 단위여야 한다 (마스크 tail이 페어 경계에서 끊기므로).
-        if (ki.real_rows[e] <= 0 || ki.real_rows[e] > kr || ki.real_rows[e] % 2 != 0 ||
+        // real == 0은 kr == 0일 때만 성립한다 (아래 kr - real >= K_STEP이 잡는다):
+        // "이 expert의 이 proj는 cold 몫이 없다" = 전량을 GPU 티어가 가진다.
+        if (ki.real_rows[e] < 0 || ki.real_rows[e] > kr || ki.real_rows[e] % 2 != 0 ||
             kr - ki.real_rows[e] >= T::K_STEP) {
           throw std::runtime_error(std::string("partial: ") + what +
                                    " real_rows must be an even count within one tile of the padded rows");
@@ -712,7 +725,7 @@ class AMX_MOE_BASE {
           const int j = dual ? (t >> 1) : t;
           const bool do_up = dual && (t & 1);
           const int64_t e = expert_ids[j];
-          if (config_.should_skip_expert(e)) {
+          if (config_.skip_gateup(e)) {
             return;
           }
           // 점수 테이블도 weight와 같은 인덱스로 gather되어 들어오므로, expert
@@ -734,8 +747,9 @@ class AMX_MOE_BASE {
             build_pair_mask(xu, config_.up_k(e), config_.up_k_real(e), ua, uc,
                             thr_of(u_t, e, sp.ng, sp.grid, s_up[j]), m_pair_mask_up_[e].data());
             if constexpr (kHasPlanEncoder) {
-              T::build_plan(m_pair_mask_up_[e].data(), xu, config_.up_k(e), plan_arena_for((int)e, 1),
-                            &m_plan_up_[e]);
+              amx::build_plan_for<T>(m_pair_mask_up_[e].data(), xu, config_.up_k(e),
+                                     plan_arena_for((int)e, 1), &m_plan_up_[e],
+                                     config_.intermediate_size);
             }
             return;
           }
@@ -757,15 +771,17 @@ class AMX_MOE_BASE {
           if constexpr (kHasPlanEncoder) {
             // 마스크(정책, 절대 k)를 커널의 자료구조로 인코딩한다 — expert당
             // 1회, 결과는 read-only로 전 워커가 공유한다.
-            T::build_plan(m_pair_mask_gate_[e].data(), xg, config_.gate_k(e), plan_arena_for((int)e, 0),
-                          &m_plan_gate_[e]);
+            amx::build_plan_for<T>(m_pair_mask_gate_[e].data(), xg, config_.gate_k(e),
+                                   plan_arena_for((int)e, 0), &m_plan_gate_[e],
+                                   config_.intermediate_size);
           }
           if (!dual) {
             build_pair_mask(xg, config_.up_k(e), config_.up_k_real(e), ua, uc,
                             thr_of(u_t, e, sp.ng, sp.grid, s_up[j]), m_pair_mask_up_[e].data());
             if constexpr (kHasPlanEncoder) {
-              T::build_plan(m_pair_mask_up_[e].data(), xg, config_.up_k(e), plan_arena_for((int)e, 1),
-                            &m_plan_up_[e]);
+              amx::build_plan_for<T>(m_pair_mask_up_[e].data(), xg, config_.up_k(e),
+                                     plan_arena_for((int)e, 1), &m_plan_up_[e],
+                                     config_.intermediate_size);
             }
           }
         },
@@ -792,7 +808,7 @@ class AMX_MOE_BASE {
         k, nullptr,
         [&](int j) {
           const int64_t e = expert_ids[j];
-          if (config_.should_skip_expert(e)) {
+          if (config_.skip_down(e)) {
             return;
           }
           const size_t off = (size_t)config_.down_row_base(e);
@@ -808,8 +824,8 @@ class AMX_MOE_BASE {
           build_pair_mask(src, config_.down_k(e), config_.down_k_real(e), da, dc,
                           thr_of(d_t, e, sp.ng, sp.grid, s_down[j]), m_pair_mask_down_[e].data());
           if constexpr (kHasPlanEncoder) {
-            T::build_plan(m_pair_mask_down_[e].data(), src, config_.down_k(e), plan_arena_for((int)e, 2),
-                          &m_plan_down_[e]);
+            amx::build_plan_for<T>(m_pair_mask_down_[e].data(), src, config_.down_k(e),
+                                   plan_arena_for((int)e, 2), &m_plan_down_[e], config_.down_n());
           }
         },
         nullptr);
@@ -822,7 +838,7 @@ class AMX_MOE_BASE {
     int activated_expert = 0;
     std::fill(m_local_num_.begin(), m_local_num_.end(), 0);
     for (int i = 0; i < k; i++) {
-      if (config_.should_skip_expert(expert_ids[i])) {
+      if (config_.skip_gateup(expert_ids[i])) {
         continue;
       }
       m_local_pos_[0][i] = 0;  // export가 pos 기반이라 decode도 채운다 (퇴화값)
@@ -912,12 +928,17 @@ class AMX_MOE_BASE {
 
   // ── prefill(qlen>1) 전용: kt forward_prefill의 1~3단계 동형 ─────────────
   // 라우팅: 토큰을 expert 그룹으로 배치 (m_local_pos_[m][j] = 그룹 내 행).
-  int prepare_prefill_routing(int qlen, int k, const int64_t* expert_ids) {
+  //
+  // skip 판정이 단계별이므로(gate/up이 빈 expert와 down이 빈 expert가 다르다)
+  // 라우팅도 단계를 알아야 한다 — 그룹 배치가 곧 export의 slot 대응이라,
+  // 다른 단계의 판정으로 묶으면 빈 expert가 그룹에 남아 pack이 0행을 pack한다.
+  int prepare_prefill_routing(int qlen, int k, const int64_t* expert_ids, bool down_stage) {
     int activated_expert = 0;
     std::fill(m_local_num_.begin(), m_local_num_.end(), 0);
     for (int i = 0; i < qlen; i++) {
       for (int j = 0; j < k; j++) {
-        if (config_.should_skip_expert(expert_ids[i * k + j])) {
+        const int64_t e_ = expert_ids[i * k + j];
+        if (down_stage ? config_.skip_down(e_) : config_.skip_gateup(e_)) {
           continue;
         }
         m_local_pos_[i][j] = m_local_num_[expert_ids[i * k + j]]++;
@@ -1008,7 +1029,7 @@ class AMX_MOE_BASE {
     direct_or_pool(qlen, [&](int i) {
       for (int j = 0; j < k; j++) {
         const int64_t e = expert_ids[i * k + j];
-        if (config_.should_skip_expert(e)) {
+        if (config_.skip_gateup(e)) {
           continue;
         }
         const ggml_bf16_t* row = x + (size_t)i * config_.hidden_size;
@@ -1048,7 +1069,7 @@ class AMX_MOE_BASE {
       for (int j = 0; j < k; j++) {
         int64_t e = expert_ids[m * k + j];
         ggml_bf16_t* dst = out + ((size_t)m * k + j) * row_elems;
-        if (config_.should_skip_expert(e)) {
+        if (config_.skip_gateup(e)) {
           // 이 expert는 다른 소비자(GPU cold hybrid)가 계산한다 — 우리 열 구간을
           // 0으로 채워 rejoin 합에서 무해하게 한다 (staging은 재사용 버퍼라 stale).
           std::memset(dst + n_off, 0, inter * sizeof(ggml_bf16_t));
@@ -1106,7 +1127,7 @@ class AMX_MOE_BASE {
     }
     m_sparse_active_ = false;  // prefill-dense
     PartialTimer tm("down", tp_part_idx, qlen);
-    int activated_expert = prepare_prefill_routing(qlen, k, expert_ids);
+    int activated_expert = prepare_prefill_routing(qlen, k, expert_ids, /*down_stage=*/true);
     if (activated_expert == 0) {
       return;
     }
@@ -1127,7 +1148,7 @@ class AMX_MOE_BASE {
     int activated_expert = 0;
     std::fill(m_local_num_.begin(), m_local_num_.end(), 0);
     for (int i = 0; i < k; i++) {
-      if (config_.should_skip_expert(expert_ids[i])) {
+      if (config_.skip_down(expert_ids[i])) {
         continue;
       }
       m_local_pos_[0][i] = 0;  // export가 pos 기반 (decode 퇴화값)
@@ -1155,7 +1176,7 @@ class AMX_MOE_BASE {
     ggml_bf16_t* gather_cursor = m_local_input_;  // 인덱스형 gather 목적지
     for (int j = 0; j < k; j++) {
       int64_t e = expert_ids[j];
-      if (config_.should_skip_expert(e)) {
+      if (config_.skip_down(e)) {
         continue;
       }
       size_t max_m = (qlen + M_STEP - 1) / M_STEP * M_STEP;
@@ -1246,7 +1267,7 @@ class AMX_MOE_BASE {
     direct_or_pool(qlen, [&](int i) {
       for (int j = 0; j < k; j++) {
         const int64_t e = expert_ids[i * k + j];
-        if (config_.should_skip_expert(e)) {
+        if (config_.skip_down(e)) {
           continue;
         }
         const size_t band = (size_t)config_.down_k(e);
@@ -1272,7 +1293,7 @@ class AMX_MOE_BASE {
       for (int j = 0; j < k; j++) {
         int64_t e = expert_ids[m * k + j];
         ggml_bf16_t* dst = out + ((size_t)m * k + j) * h_total;
-        if (config_.should_skip_expert(e)) {
+        if (config_.skip_down(e)) {
           std::memset(dst + n_off, 0, rows * sizeof(ggml_bf16_t));  // GPU cold hybrid 몫
           continue;
         }

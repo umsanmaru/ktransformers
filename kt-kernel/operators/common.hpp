@@ -394,6 +394,21 @@ struct GeneralMOEConfig {
     return expert_id < 0 || expert_id >= expert_num || (gpu_experts_mask && gpu_experts_mask[expert_id]);
   }
 
+  // 단계별 skip: cold 몫이 **0행**인 expert는 이 노드가 계산할 것이 없다.
+  // gpu_experts_mask와 의미론이 같고(계산 없음 + export가 0을 쓴다) 시점만
+  // 다르다 — 마스크는 step마다 정해지고, 이쪽은 기하가 로드 때 정한다.
+  // 예산이 expert별로 갈리는 plan(전량 GPU 티어인 expert)에서 나온다.
+  // 단계로 나눈 이유는 K가 proj별이기 때문이다: gate/up이 비어도 down은
+  // 남을 수 있다(그 반대도). gate와 up은 한 단계에서 융합되므로 **둘 다**
+  // 비어야 건너뛴다 — 한쪽만 비는 기하는 로더가 거부한다(validate_kindex).
+  inline bool skip_gateup(int64_t expert_id) const {
+    return should_skip_expert(expert_id) ||
+           (partial.enabled && gate_k((int)expert_id) == 0 && up_k((int)expert_id) == 0);
+  }
+  inline bool skip_down(int64_t expert_id) const {
+    return should_skip_expert(expert_id) || (partial.enabled && down_k((int)expert_id) == 0);
+  }
+
   void* gate_proj = nullptr;
   void* up_proj = nullptr;
   void* down_proj = nullptr;

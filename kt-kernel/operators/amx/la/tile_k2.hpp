@@ -65,18 +65,35 @@ struct GemmKernelTileK2BF16 : GemmKernel224BF16RowMajorNC {
   static size_t plan_arena_bytes(int k) {
     const size_t pairs = (size_t)k / 2;
     const size_t cols = (size_t)k / K_STEP + 2;
-    return (pairs * 2 + cols) * sizeof(uint32_t) + 64;
+    // pairs × 3 = koff + koff_tail + pval. 꼬리 표는 슬랩 n이 N_BLOCK의 배수일
+    // 때 안 쓰이지만 자리는 늘 잡는다 — arena 크기가 k만의 함수라는 성질(moe_base가
+    // expert별로 미리 재는 근거)을 유지하는 값이 그 낭비보다 크다.
+    return (pairs * 3 + cols) * sizeof(uint32_t) + 64;
   }
 
   /// `mask == nullptr`이면 dense (전 페어 유지). 결과는 read-only이고 모든
   /// 워커가 공유한다.
+  ///
+  /// `n_slab > 0`이고 그것이 N_BLOCK의 배수가 아니면 마지막 부분 블록용 오프셋
+  /// 표(`koff_tail`)를 같이 낸다. 꼬리에서 달라지는 것은 **타일 컬럼 stride
+  /// 하나**다 (`c * n_w * K_STEP`): `GROUP_STRIDE`(512 = 16 n × 32 k)는 폭과
+  /// 무관하고, 64 B chunk 성질(`_mm512_loadu_si512` 한 번 = 16 n × 2 k)도 그대로다.
+  /// 그래서 꼬리 폭이 `GROUP_N`의 배수이기만 하면 된다.
+  ///
+  /// `n_slab == 0`(기본)이면 꼬리 표를 만들지 않는다 — 기존 호출부는 그대로
+  /// 동작하고, `gemv_slab`이 부분 블록을 만나면 예전처럼 죽는다.
   static void build_plan(const PairMask* mask, const ggml_bf16_t* x, int k, void* arena,
-                         ActivationPlan* out) {
+                         ActivationPlan* out, int n_slab = 0) {
     const int cols = k / K_STEP;
     uint32_t* base = reinterpret_cast<uint32_t*>((reinterpret_cast<uintptr_t>(arena) + 63) & ~(uintptr_t)63);
     uint32_t* koff = base;
-    uint32_t* pval = koff + (size_t)k / 2;
+    uint32_t* koff_tail = koff + (size_t)k / 2;
+    uint32_t* pval = koff_tail + (size_t)k / 2;
     uint32_t* seg = pval + (size_t)k / 2;
+
+    const int n_tail = (n_slab > 0) ? (n_slab % N_BLOCK) : 0;
+    assert(n_tail % GROUP_N == 0);  // 꼬리는 n-그룹 경계에 맞아야 한다
+    const uint32_t tail_col = (uint32_t)n_tail * K_STEP;
 
     const uint16_t* xs = reinterpret_cast<const uint16_t*>(x);
     int np = 0;
@@ -84,11 +101,14 @@ struct GemmKernelTileK2BF16 : GemmKernel224BF16RowMajorNC {
     for (int c = 0; c < cols; c++) {
       uint16_t bits = mask ? mask[c] : (uint16_t)0xFFFF;
       const uint32_t col_base = (uint32_t)c * TILE_ELEMS;
+      const uint32_t col_base_tail = (uint32_t)c * tail_col;
       while (bits) {
         const int j = __builtin_ctz(bits);
         bits &= (uint16_t)(bits - 1);
         const int kk = c * K_STEP + 2 * j;
-        koff[np] = col_base + (uint32_t)j * (2 * GROUP_N);
+        const uint32_t in_col = (uint32_t)j * (2 * GROUP_N);
+        koff[np] = col_base + in_col;
+        koff_tail[np] = col_base_tail + in_col;
         pval[np] = (uint32_t)xs[kk] | ((uint32_t)xs[kk + 1] << 16);
         np++;
       }
@@ -99,6 +119,8 @@ struct GemmKernelTileK2BF16 : GemmKernel224BF16RowMajorNC {
     out->seg = seg;
     out->npairs = np;
     out->nseg = cols;
+    out->koff_tail = n_tail ? koff_tail : nullptr;
+    out->ngroup_tail = n_tail / GROUP_N;
   }
 
   // ── 소비 커서 ────────────────────────────────────────────────────────
@@ -108,9 +130,9 @@ struct GemmKernelTileK2BF16 : GemmKernel224BF16RowMajorNC {
     int c, g, j, live;
   };
 
-  static inline void cursor_step(Cursor& t, const uint32_t* seg, int ncols) {
+  static inline void cursor_step(Cursor& t, const uint32_t* seg, int ncols, int ngroup = NGROUP) {
     if ((uint32_t)++t.j < seg[t.c + 1]) return;
-    if (++t.g < NGROUP) {
+    if (++t.g < ngroup) {
       t.j = (int)seg[t.c];
       return;
     }
@@ -125,7 +147,8 @@ struct GemmKernelTileK2BF16 : GemmKernel224BF16RowMajorNC {
     t.j = (int)seg[t.c];
   }
 
-  static inline Cursor cursor_start(const uint32_t* seg, int ncols, int npairs, int ahead) {
+  static inline Cursor cursor_start(const uint32_t* seg, int ncols, int npairs, int ahead,
+                                    int ngroup = NGROUP) {
     Cursor t{0, 0, 0, npairs > 0};
     if (t.live) {
       while (t.c < ncols && seg[t.c + 1] == seg[t.c]) ++t.c;
@@ -134,7 +157,7 @@ struct GemmKernelTileK2BF16 : GemmKernel224BF16RowMajorNC {
       else
         t.j = (int)seg[t.c];
     }
-    for (int i = 0; i < ahead && t.live; ++i) cursor_step(t, seg, ncols);
+    for (int i = 0; i < ahead && t.live; ++i) cursor_step(t, seg, ncols, ngroup);
     return t;
   }
 
@@ -165,21 +188,57 @@ struct GemmKernelTileK2BF16 : GemmKernel224BF16RowMajorNC {
     }
   }
 
-  /// m == 1 전용. [n0, n1)은 이 워커의 n 슬라이스이고 N_BLOCK 정렬이다.
+  /// 부분 블록용. 본체는 `super_block`과 같고 그룹 수만 런타임이다 — 그래서
+  /// `#pragma GCC unroll 16`을 붙일 수 없다. 언롤을 잃는 것은 슬랩 전체에서
+  /// **마지막 블록 하나**뿐이므로 주 경로의 코드젠은 손대지 않는다.
+  static void super_block_partial(const ggml_bf16_t* W, float* ys, const uint32_t* koff,
+                                  const uint32_t* pval, const uint32_t* seg, int ncols, int npairs,
+                                  int ngroup) {
+    Cursor cu = cursor_start(seg, ncols, npairs, PF_DIST, ngroup);
+    for (int c = 0; c < ncols; c++) {
+      const int jlo = (int)seg[c], jhi = (int)seg[c + 1];
+      if (jlo == jhi) continue;
+      for (int g = 0; g < ngroup; g++) {
+        const uint32_t go = (uint32_t)g * GROUP_STRIDE;
+        float* yg = ys + GROUP_N * g;
+        __m512 a0 = _mm512_loadu_ps(yg);
+        for (int j = jlo; j < jhi; j++) {
+          if (cu.live) {
+            _mm_prefetch((const char*)(W + koff[cu.j] + (uint32_t)cu.g * GROUP_STRIDE), _MM_HINT_T1);
+            cursor_step(cu, seg, ncols, ngroup);
+          }
+          const __m512bh vv = (__m512bh)_mm512_set1_epi32((int)pval[j]);
+          a0 = _mm512_dpbf16_ps(a0, vv, (__m512bh)_mm512_loadu_si512(W + koff[j] + go));
+        }
+        _mm512_storeu_ps(yg, a0);
+      }
+    }
+  }
+
+  /// m == 1 전용. [n0, n1)의 시작은 N_BLOCK 정렬이고, 마지막 블록은 슬랩 n이
+  /// N_BLOCK의 배수가 아니면 좁을 수 있다 (그때는 plan에 꼬리 표가 있어야 한다).
   static void gemv_slab(int m, int n, int k, int n0, int n1, BufferA* ba, BufferB* bb, BufferC* bc,
                         const ActivationPlan* plan) {
     (void)m;
     (void)ba;  // pval이 활성값을 나르므로 A 접근이 없다 (Seam B)
-    // koff 식이 n_block_size == N_BLOCK을 전제한다 (마지막 부분 블록이 있으면
-    // 타일 컬럼 stride가 달라진다). 부분 블록은 호출자가 걸러야 한다 — 조용히
-    // 남의 열을 읽느니 여기서 죽는다.
-    assert(n % N_BLOCK == 0);
+    // `koff`는 타일 컬럼 stride를 `N_BLOCK * K_STEP`으로 접어 넣은 표다. 마지막
+    // 블록이 좁으면 그 stride가 달라지므로 `koff_tail`이 필요하다 — 없으면 조용히
+    // 남의 열을 읽느니 여기서 죽는다 (Release에는 assert가 없으니 호출부의 검증이
+    // 여전히 1차 방어선이다).
+    assert(n % N_BLOCK == 0 || plan->koff_tail != nullptr);
     float* c_row = bc->c;
     // ymem 정책은 누산기를 메모리에서 읽어 더한다 — 시작 전에 0으로 둔다.
     for (int j = n0; j < n1; j++) c_row[j] = 0.0f;
     for (int nb = n0; nb < n1; nb += N_BLOCK) {
       const ggml_bf16_t* W = bb->b + (size_t)nb * k;
-      super_block(W, c_row + nb, plan->koff, plan->pval, plan->seg, plan->nseg, plan->npairs);
+      const int w = std::min(N_BLOCK, n - nb);
+      if (w == N_BLOCK) {
+        super_block(W, c_row + nb, plan->koff, plan->pval, plan->seg, plan->nseg, plan->npairs);
+      } else {
+        assert(plan->koff_tail != nullptr && plan->ngroup_tail == w / GROUP_N);
+        super_block_partial(W, c_row + nb, plan->koff_tail, plan->pval, plan->seg, plan->nseg,
+                            plan->npairs, plan->ngroup_tail);
+      }
     }
   }
 };

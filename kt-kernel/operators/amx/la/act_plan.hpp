@@ -14,6 +14,7 @@
  */
 
 #include <cstdint>
+#include <type_traits>
 
 namespace amx {
 
@@ -29,8 +30,37 @@ struct ActivationPlan {
   const uint32_t* seg = nullptr;   ///< 타일 컬럼 접두: 컬럼 c는 [seg[c], seg[c+1])
   int npairs = 0;
   int nseg = 0;
+  /// 마지막 **부분** n-블록용 오프셋. 블록 폭이 커널의 N_BLOCK보다 좁으면 타일
+  /// 컬럼 stride가 달라지므로 오프셋 표가 한 벌 더 필요하다. `pval`/`seg`는
+  /// 그대로 공유한다 — 마스크는 k축이고 n-블록은 n축이라 직교하기 때문이다.
+  /// nullptr = 부분 블록 없음 (슬랩 n이 N_BLOCK의 배수).
+  const uint32_t* koff_tail = nullptr;
+  int ngroup_tail = 0;  ///< 꼬리 블록의 n-그룹 수 (= 꼬리 폭 / GROUP_N)
 
   bool empty() const { return npairs == 0; }
 };
+
+/// 이 커널의 `build_plan`이 슬랩 n을 받는가 (= 부분 n-블록을 지원하는가).
+/// 지원하는 커널만 꼬리 오프셋 표를 만들 수 있고, 나머지는 5인자 서명 그대로다
+/// — 그래서 operator 쪽 호출부를 커널별로 갈라 쓰지 않아도 된다.
+template <class K, class = void>
+struct plan_takes_slab_n : std::false_type {};
+template <class K>
+struct plan_takes_slab_n<K, std::void_t<decltype(K::build_plan(
+                                (const PairMask*)nullptr, (const ggml_bf16_t*)nullptr, 0,
+                                (void*)nullptr, (ActivationPlan*)nullptr, 0))>> : std::true_type {};
+
+/// `build_plan` 호출의 단일 창구. 슬랩 n을 받는 커널에는 넘기고, 아닌 커널에는
+/// 넘기지 않는다 (부분 블록은 그 커널에서 여전히 호출부가 막아야 한다).
+template <class K>
+inline void build_plan_for(const PairMask* mask, const ggml_bf16_t* x, int k, void* arena,
+                           ActivationPlan* out, int n_slab) {
+  if constexpr (plan_takes_slab_n<K>::value) {
+    K::build_plan(mask, x, k, arena, out, n_slab);
+  } else {
+    (void)n_slab;
+    K::build_plan(mask, x, k, arena, out);
+  }
+}
 
 }  // namespace amx
