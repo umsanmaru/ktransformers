@@ -20,6 +20,16 @@
 
 #include "fp8-moe.hpp"
 #include "la/tile_k2_fp8b128.hpp"
+#include "la/tile_k2_fp8pt.hpp"
+
+/// 커널이 per-tensor 배율(`kPerTensorScale`, SCALE_BLK == 0)을 쓰는가. 없으면 128×128 블록.
+template <class K>
+constexpr bool fp8_tile_per_tensor_f() {
+  if constexpr (requires { K::kPerTensorScale; }) return K::kPerTensorScale;
+  else return false;
+}
+template <class K>
+inline constexpr bool fp8_tile_per_tensor_v = fp8_tile_per_tensor_f<K>();
 
 template <class T = amx::GemmKernelTileK2FP8B128>
 class TILE_FP8_MOE_TP : public AMX_MOE_BASE<T, TILE_FP8_MOE_TP<T>> {
@@ -43,6 +53,7 @@ class TILE_FP8_MOE_TP : public AMX_MOE_BASE<T, TILE_FP8_MOE_TP<T>> {
   using Base::up_bc_;
 
  public:
+  using kernel_t = T;
   using typename Base::input_t;
   using typename Base::output_t;
 
@@ -51,9 +62,11 @@ class TILE_FP8_MOE_TP : public AMX_MOE_BASE<T, TILE_FP8_MOE_TP<T>> {
 
   void derived_init() {
     auto& quant_config = config_.quant_config;
+    // group_size는 커널의 배율 기하와 일치해야 한다: b128 = 128, per-tensor = 0.
     if (quant_config.group_size != T::SCALE_BLK || quant_config.zero_point)
-      throw std::runtime_error(
-          "TILE_FP8_MOE_TP: block-wise FP8 only (group_size must be 128, no zero point)");
+      throw std::runtime_error("TILE_FP8_MOE_TP<" + T::name() + ">: group_size must be " +
+                               std::to_string(T::SCALE_BLK) + " (got " + std::to_string(quant_config.group_size) +
+                               "), no zero point");
     // 타일 super = 256 n: 노드 N shard가 256 배수가 아니면 pack이 부분 super를 만들 수 없다.
     if (config_.intermediate_size % T::N_BLOCK || config_.down_n() % T::N_BLOCK)
       throw std::runtime_error("TILE_FP8_MOE_TP: node N shards (inter " +
@@ -117,42 +130,49 @@ class TILE_FP8_MOE_TP : public AMX_MOE_BASE<T, TILE_FP8_MOE_TP<T>> {
              down_bc_[expert_idx].get(), ith, nth, pl);
   }
 
-  // per-TP pack: codes는 행우선 e4m3 → 타일 순열, 배율은 n-major fp32 → 전치 fp32.
+  // 배율 소스 포인터: b128은 n-major [N/128][k/128] 블록표의 expert 시작, per-tensor는 [E]의 e번째.
+  const float* scale_src(const void* base, size_t n, size_t row_base_le, uint64_t le) const {
+    if constexpr (fp8_tile_per_tensor_v<T>) {
+      (void)n; (void)row_base_le;
+      return (const float*)base + le;
+    } else {
+      const size_t B = T::SCALE_BLK;
+      return (const float*)base + (n / B) * (row_base_le / B);
+    }
+  }
+
+  // per-TP pack: codes는 행우선 e4m3 → 타일 순열, 배율은 n-major fp32 → 전치 fp32 (b128) / 스칼라 1개 (pt).
   void load_weights() {
     const uint64_t* physical_to_logical_map = (const uint64_t*)config_.physical_to_logical_map;
     auto pool = config_.pool->get_subpool(tp_part_idx);
     if (config_.gate_scale == nullptr) throw std::runtime_error("TILE_FP8_MOE_TP: scales required");
-    const size_t B = T::SCALE_BLK;
     const size_t I = config_.intermediate_size, DN = config_.down_n();
 
     int nth = T::recommended_nth(config_.intermediate_size);
     pool->do_work_stealing_job(
         nth * config_.expert_num, nullptr,
-        [this, nth, physical_to_logical_map, I, B](int task_id) {
+        [this, nth, physical_to_logical_map, I](int task_id) {
           const uint64_t e = task_id / nth;
           const uint64_t le = expert_map(physical_to_logical_map, e);
           const int ith = task_id % nth;
           gate_bb_[e]->from_raw_mat((const uint8_t*)config_.gate_proj + I * (size_t)config_.gate_row_base(le), ith,
                                     nth);
           up_bb_[e]->from_raw_mat((const uint8_t*)config_.up_proj + I * (size_t)config_.up_row_base(le), ith, nth);
-          gate_bb_[e]->from_scales(
-              (const float*)config_.gate_scale + (I / B) * ((size_t)config_.gate_row_base(le) / B), ith, nth);
-          up_bb_[e]->from_scales(
-              (const float*)config_.up_scale + (I / B) * ((size_t)config_.up_row_base(le) / B), ith, nth);
+          gate_bb_[e]->from_scales(scale_src(config_.gate_scale, I, (size_t)config_.gate_row_base(le), le), ith, nth);
+          up_bb_[e]->from_scales(scale_src(config_.up_scale, I, (size_t)config_.up_row_base(le), le), ith, nth);
         },
         nullptr);
 
     nth = T::recommended_nth(config_.down_n());
     pool->do_work_stealing_job(
         nth * config_.expert_num, nullptr,
-        [this, nth, physical_to_logical_map, DN, B](int task_id) {
+        [this, nth, physical_to_logical_map, DN](int task_id) {
           const uint64_t e = task_id / nth;
           const uint64_t le = expert_map(physical_to_logical_map, e);
           const int ith = task_id % nth;
           down_bb_[e]->from_raw_mat((const uint8_t*)config_.down_proj + DN * (size_t)config_.down_row_base(le), ith,
                                     nth);
-          down_bb_[e]->from_scales(
-              (const float*)config_.down_scale + (DN / B) * ((size_t)config_.down_row_base(le) / B), ith, nth);
+          down_bb_[e]->from_scales(scale_src(config_.down_scale, DN, (size_t)config_.down_row_base(le), le), ith, nth);
         },
         nullptr);
   }
@@ -167,14 +187,17 @@ class TILE_FP8_MOE_TP : public AMX_MOE_BASE<T, TILE_FP8_MOE_TP<T>> {
 
 // FP8 타일 weight staging (Prism partial 전용): full 텐서 → per-TP N-shard 사본 → 각 TP가 pack.
 // mxfp4의 `mxfp4_tp_load_weights` partial 분기와 동형이고, 다른 것은 원소 크기(1 B)와 배율
-// 기하(fp32, 128×128 블록)뿐이다.
+// 기하뿐이다: b128은 fp32 128×128 블록표(N-shard로 잘라 복사), per-tensor는 proj당 fp32 [E]
+// (shard와 무관 — expert별 스칼라를 그대로 복사).
 template <class TPM>
 inline void fp8_tile_tp_load_weights(TPM& self) {
+  using K = typename TPM::kernel_t;
+  constexpr bool kPT = fp8_tile_per_tensor_v<K>;
   auto& config = self.config;
   auto& tps = self.tps;
   auto pool = config.pool;
   const uint64_t* physical_to_logical_map = (const uint64_t*)config.physical_to_logical_map;
-  const size_t B = amx::GemmKernelTileK2FP8B128::SCALE_BLK;
+  const size_t B = kPT ? 1 : (size_t)K::SCALE_BLK;  // pt에서는 나눗셈 회피용 더미 (아래 분기에서 안 쓴다)
 
   if (config.gate_proj == nullptr || config.gate_scale == nullptr)
     throw std::runtime_error("TILE_FP8_MOE_TP: needs packed e4m3 weights + fp32 block scales");
@@ -191,9 +214,15 @@ inline void fp8_tile_tp_load_weights(TPM& self) {
     tpc.gate_proj = new uint8_t[g_tot];
     tpc.up_proj = new uint8_t[u_tot];
     tpc.down_proj = new uint8_t[d_tot];
-    tpc.gate_scale = new float[g_tot / (B * B)];
-    tpc.up_scale = new float[u_tot / (B * B)];
-    tpc.down_scale = new float[d_tot / (B * B)];
+    if constexpr (kPT) {
+      tpc.gate_scale = new float[tpc.expert_num];
+      tpc.up_scale = new float[tpc.expert_num];
+      tpc.down_scale = new float[tpc.expert_num];
+    } else {
+      tpc.gate_scale = new float[g_tot / (B * B)];
+      tpc.up_scale = new float[u_tot / (B * B)];
+      tpc.down_scale = new float[d_tot / (B * B)];
+    }
     const size_t gu_n_off = (size_t)tpc.partial.gateup_n.offset;
     const size_t dn_n_off = (size_t)tpc.partial.down_n.offset;
     const size_t I_full = config.intermediate_size, H_full = config.hidden_size;
@@ -212,6 +241,13 @@ inline void fp8_tile_tp_load_weights(TPM& self) {
           memcpy((uint8_t*)tpc.gate_proj + I * (size_t)tpc.gate_row_base(e), g_src, I * g_k);
           memcpy((uint8_t*)tpc.up_proj + I * (size_t)tpc.up_row_base(e), u_src, I * u_k);
           memcpy((uint8_t*)tpc.down_proj + DN * (size_t)tpc.down_row_base(e), d_src, DN * d_k);
+          if constexpr (kPT) {
+            // per-tensor: expert(슬롯)당 스칼라 하나, N-shard와 무관.
+            ((float*)tpc.gate_scale)[e] = ((const float*)config.gate_scale)[e];
+            ((float*)tpc.up_scale)[e] = ((const float*)config.up_scale)[e];
+            ((float*)tpc.down_scale)[e] = ((const float*)config.down_scale)[e];
+            return;
+          }
           // 배율은 n-major [N/128][k/128]이라 shard 행 시작이 (n_off/128) 블록행이다.
           const float* gs_src = (const float*)config.gate_scale +
                                 (I_full / B) * ((size_t)config.gate_row_base(e) / B) + (gu_n_off / B) * (g_k / B);
@@ -227,7 +263,7 @@ inline void fp8_tile_tp_load_weights(TPM& self) {
                  sizeof(float) * (DN / B) * (d_k / B));
         },
         nullptr);
-    printf("TP %d (partial fp8 tile) load weight done.\n", i);
+    printf("TP %d (partial fp8 tile%s) load weight done.\n", i, kPT ? ", per-tensor" : "");
   });
 
   pool->dispense_backend()->do_numa_job([&](int numa_id) {
@@ -252,6 +288,7 @@ template <typename K>
 class TP_MOE<TILE_FP8_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, TILE_FP8_MOE_TP<K>>> {
  public:
   using Base = TP_MOE<AMX_MOE_BASE<K, TILE_FP8_MOE_TP<K>>>;
+  using kernel_t = K;
   using Base::Base;
   template <class TPM>
   friend void fp8_tile_tp_load_weights(TPM& self);
@@ -261,7 +298,8 @@ class TP_MOE<TILE_FP8_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, TILE_FP8_MOE_TP
     this->tps[node]->set_gpu_experts_mask(reinterpret_cast<const uint8_t*>(mask_ptr));
   }
 
-  // 레이아웃은 GemmKernelTileK2FP8B128::BufferB (codes 타일 + 전치 fp32 배율) — sglang KT_TILE8 로더.
+  // 레이아웃은 K::BufferB — b128: codes 타일 + 전치 fp32 배율표 (sglang KT_TILE8 로더),
+  // pt: 같은 codes 타일 + 64 B 슬롯의 fp32 배율 1개 (sglang kt_tile8pt).
   std::vector<PrismColdSlabView> cold_slab_views() const {
     std::vector<PrismColdSlabView> out;
     for (int i = 0; i < this->tp_count; ++i) {

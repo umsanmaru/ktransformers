@@ -1054,6 +1054,9 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   // tile_k2_fp8b128 포팅). Prism cold 전용 — prefill은 sglang이 GPU(KT_TILE8)로 보낸다.
   bind_moe_module<TILE_FP8_MOE_TP<amx::GemmKernelTileK2FP8B128>, /*WithPartial=*/true>(moe_module,
                                                                                         "TileK2FP8B128_MOE");
+  // 같은 fp8 타일 레이아웃, 배율은 행렬당 fp32 1개 (Mistral-Medium-3.5 static-tensor FP8). k % 32.
+  bind_moe_module<TILE_FP8_MOE_TP<amx::GemmKernelTileK2FP8PT>, /*WithPartial=*/true>(moe_module,
+                                                                                     "TileK2FP8PT_MOE");
   bind_moe_module<AMX_MXFP8_MOE_TP<amx::GemmKernel224MXFP8SmallKGroup>>(moe_module, "AMXMXFP8_KGroup_MOE");
 #endif
 #if defined(__AVX512BF16__)
