@@ -57,6 +57,7 @@
 
 #include "amx_kernels.hpp"  // AMX_AVAILABLE, which amx_raw_kernels.hpp expects its includer to provide
 #include "amx_raw_kernels.hpp"
+#include "sw_prefetch.hpp"
 
 namespace amx {
 
@@ -301,7 +302,8 @@ struct GemmKernel224BF16RowMajorNC {
       GemmKernel224BF16::load_c(c, ldc);
     }
 
-    const bool prefetch_b = m_begin == 0;
+    // KT_SW_PREFETCH=0 (ablation) drops the B prefetch entirely; see sw_prefetch.hpp.
+    const bool prefetch_b = m_begin == 0 && sw_prefetch_enabled();
     // Elements between one k-step's strip run and the next one.
     const int n_block_size = std::min((int)N_BLOCK, n - n_begin / N_BLOCK * N_BLOCK);
     const size_t k_step_run = (size_t)n_block_size * K_STEP;
