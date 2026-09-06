@@ -31,8 +31,8 @@
 #include <string>
 #include <vector>
 
+#include "amx_raw_buffers.hpp"  // ggml_bf16_t 먼저 (act_plan.hpp가 전제한다)
 #include "act_plan.hpp"
-#include "amx_raw_buffers.hpp"
 #include "tile_k2_fp8b128_port.hpp"
 
 namespace amx {

@@ -59,6 +59,10 @@ _PARTIAL_MOE_CLASSES = {
     # 같은 입력 텐서·같은 slab 기하; sparsity 테이블은 thr 곡선 셋만 받는다 (wn_sq/pair_dot 불필요).
     # prefill은 GPU KT_TILE8_K1 로더가 slab을 읽는다.
     "kt_tile_k1_fp8b128": lambda: kt_kernel_ext.moe.TileK1FP8B128_MOE,
+    # FP8 e4m3 **per-tensor** 배율 (Mistral-Medium-3.5 static-tensor FP8: weight_block_size null).
+    # 코드 타일 레이아웃은 b128과 같고 배율은 proj당 fp32 [E] (expert = dense 슬롯당 스칼라 1개).
+    # 노드 N shard 256 배수, K 32 배수 (128 제약 없음).
+    "kt_tile_k2_fp8pt": lambda: kt_kernel_ext.moe.TileK2FP8PT_MOE,
 }
 
 # 커널 키 → (weight dtype, 원소당 바이트 분모, 배율 dtype 또는 None, 배율 원소당 weight 원소 수,
@@ -71,6 +75,8 @@ _WEIGHT_FORMAT = {
     "kt_tile_k2_mxfp4": (torch.uint8, 2, torch.bfloat16, 32, 32),
     "kt_tile_k2_fp8b128": (torch.uint8, 1, torch.float32, 128 * 128, 128),
     "kt_tile_k1_fp8b128": (torch.uint8, 1, torch.float32, 128 * 128, 128),
+    # scale_div None = "expert당 배율 1개" (weight 원소 수와 무관하게 [E]). group_size 0 = per-tensor.
+    "kt_tile_k2_fp8pt": (torch.uint8, 1, torch.float32, None, 0),
 }
 FP4_GROUP_SIZE = 32
 
@@ -111,7 +117,8 @@ class PartialMoEWrapper:
         양자화 키면 배율 셋이 필수다: kt_amx_fp4/kt_tile_k2_mxfp4는 weight가 uint8 nibble
         (원소 2개/바이트) + 배율 bf16(32-k 블록당 1, C++가 fp32 또는 전치 E8M0으로 변환),
         kt_tile_k2_fp8b128은 weight가 e4m3 바이트 + 배율 fp32(128×128 블록당 1, n-major
-        `scale_inv`).
+        `scale_inv`), kt_tile_k2_fp8pt는 e4m3 바이트 + 배율 fp32 [E] (expert당 스칼라 1개,
+        per-tensor `weight_scale_inv`).
 
         페어 마스크 커널(k2wl2)은 키 9개 전부, per-k 커널(`mask_per_k`, score k1)은
         thr_gate/thr_up/thr_down 셋만 필요하다 (나머지가 와도 무시). 전부 fp32 contiguous CPU:
@@ -151,7 +158,8 @@ class PartialMoEWrapper:
         scales = (gate_scale, up_scale, down_scale)
         if s_dtype is not None:
             for name, t in zip(("gate_scale", "up_scale", "down_scale"), scales):
-                _check(name, t, expect[name.split("_")[0]] // s_div, s_dtype)
+                want = cfg.expert_num if s_div is None else expect[name.split("_")[0]] // s_div
+                _check(name, t, want, s_dtype)
             cfg.quant_config.group_size = group_size
             cfg.quant_config.zero_point = False
         elif any(t is not None for t in scales):

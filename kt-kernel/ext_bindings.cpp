@@ -1060,6 +1060,9 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   // k=1 형제: 64 B 라인 = k 한 행, per-k 마스크(|x| >= thr, score k1). prefill은 GPU KT_TILE8_K1.
   bind_moe_module<TILE_FP8_MOE_TP<amx::GemmKernelTileK1FP8B128>, /*WithPartial=*/true>(moe_module,
                                                                                         "TileK1FP8B128_MOE");
+  // 같은 fp8 타일 레이아웃, 배율은 행렬당 fp32 1개 (Mistral-Medium-3.5 static-tensor FP8). k % 32.
+  bind_moe_module<TILE_FP8_MOE_TP<amx::GemmKernelTileK2FP8PT>, /*WithPartial=*/true>(moe_module,
+                                                                                     "TileK2FP8PT_MOE");
   bind_moe_module<AMX_MXFP8_MOE_TP<amx::GemmKernel224MXFP8SmallKGroup>>(moe_module, "AMXMXFP8_KGroup_MOE");
 #endif
 #if defined(__AVX512BF16__)
