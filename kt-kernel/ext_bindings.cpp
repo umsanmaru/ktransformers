@@ -552,6 +552,9 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
     // cudaHostRegister 후 grouped GEMM(cold layout 변형)으로 제자리 읽는다.
     moe_cls.def("set_node_gpu_experts_mask", &MoeClass::set_node_gpu_experts_mask, py::arg("node"),
                 py::arg("mask_ptr"));
+    // Seam B 마스크 종류: true면 per-k(score k1, thr 곡선만 필요), false면 페어(k2wl2, wn²/pair_dot 필요).
+    // 파이썬(experts_partial / sglang cold_backend)이 요구 테이블 집합과 plan score 정합을 이걸로 정한다.
+    moe_cls.def_property_readonly_static("mask_per_k", [](py::object) { return MoeTP::kMaskPerK; });
     moe_cls.def("cold_slab_views", [](MoeClass& self) {
       py::list out;
       for (const auto& v : self.cold_slab_views()) {
@@ -1054,6 +1057,9 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   // tile_k2_fp8b128 포팅). Prism cold 전용 — prefill은 sglang이 GPU(KT_TILE8)로 보낸다.
   bind_moe_module<TILE_FP8_MOE_TP<amx::GemmKernelTileK2FP8B128>, /*WithPartial=*/true>(moe_module,
                                                                                         "TileK2FP8B128_MOE");
+  // k=1 형제: 64 B 라인 = k 한 행, per-k 마스크(|x| >= thr, score k1). prefill은 GPU KT_TILE8_K1.
+  bind_moe_module<TILE_FP8_MOE_TP<amx::GemmKernelTileK1FP8B128>, /*WithPartial=*/true>(moe_module,
+                                                                                        "TileK1FP8B128_MOE");
   bind_moe_module<AMX_MXFP8_MOE_TP<amx::GemmKernel224MXFP8SmallKGroup>>(moe_module, "AMXMXFP8_KGroup_MOE");
 #endif
 #if defined(__AVX512BF16__)

@@ -33,6 +33,7 @@
 #include "../common.hpp"
 #include "../moe-tp.hpp"
 #include "la/act_plan.hpp"
+#include "k_mask.hpp"
 #include "pair_mask.hpp"
 #include "la/amx.hpp"
 #include "llama.cpp/ggml.h"
@@ -119,9 +120,13 @@ class AMX_MOE_BASE {
   std::vector<amx::ActivationPlan> m_plan_gate_, m_plan_up_, m_plan_down_;
   std::vector<size_t> m_plan_off_;  // [E+1] expert별 arena 오프셋 (바이트)
 
-  std::vector<std::vector<uint16_t>> m_pair_mask_gate_;
-  std::vector<std::vector<uint16_t>> m_pair_mask_up_;
-  std::vector<std::vector<uint16_t>> m_pair_mask_down_;
+  // 마스크 워드: 페어 커널은 PairMask(uint16, 비트 = 페어), per-k 커널(kMaskPerK)은
+  // KMask(uint32, 비트 = k). 둘 다 워드 하나가 32 k라 워드 수(k / K_STEP)는 같다.
+  static constexpr bool kMaskPerK = amx::mask_per_k<T>::value;
+  using MaskWord = std::conditional_t<kMaskPerK, amx::KMask, amx::PairMask>;
+  std::vector<std::vector<MaskWord>> m_pair_mask_gate_;
+  std::vector<std::vector<MaskWord>> m_pair_mask_up_;
+  std::vector<std::vector<MaskWord>> m_pair_mask_down_;
   bool m_sparse_active_ = false;  // 이 호출이 sparse 경로인가
   // s 벡터의 스택 상한 (num_experts_per_tok). 넘으면 ctor에서 즉사한다.
   static constexpr int kMaxTopK = 64;
@@ -598,7 +603,7 @@ class AMX_MOE_BASE {
     } else {
       prefetch_bytes(row + ki.offset, (size_t)kr * sizeof(ggml_bf16_t));
     }
-    if (sparse) {
+    if (sparse && a) {  // per-k 커널은 점수 테이블이 없다 (a == c == nullptr)
       prefetch_bytes(a, (size_t)kr * sizeof(float));
       prefetch_bytes(c, (size_t)(kr / 2) * sizeof(float));
     }
@@ -627,6 +632,21 @@ class AMX_MOE_BASE {
   static void build_pair_mask(const ggml_bf16_t* src, int k_rows, int k_real, const float* a_sq, const float* c,
                               float thr, uint16_t* out) {
     amx::build_pair_mask(src, k_rows, k_real, a_sq, c, thr, out);
+  }
+
+  // ── per-k 마스크 (score `k1`, 2026-09-05) ───────────────────────────────
+  // keep_k = |x_k| >= thr. 가중치 통계(a_sq/c)를 쓰지 않는다 — 구현은 k_mask.hpp.
+  // 마스크 종류를 하나로 부르는 창구: 커널이 요구하는 쪽을 컴파일 타임에 고른다.
+  // 페어 경로의 인자·순서는 그대로다 (계약 ①의 k2wl2 수치는 손대지 않는다).
+  static void build_mask(const ggml_bf16_t* src, int k_rows, int k_real, const float* a_sq, const float* c,
+                         float thr, MaskWord* out) {
+    if constexpr (kMaskPerK) {
+      (void)a_sq;
+      (void)c;
+      amx::build_k_mask(src, k_rows, k_real, thr, out);
+    } else {
+      amx::build_pair_mask(src, k_rows, k_real, a_sq, c, thr, out);
+    }
   }
 
   // 예산 → s 벡터 (계약 ①). w는 [k] 라우터 가중으로, 정규화되지 않았을 수
@@ -701,10 +721,12 @@ class AMX_MOE_BASE {
     const int H = config_.hidden_size;
     const auto& sp = config_.partial.sparsity;
     const bool sparse = sp.enabled && weights != nullptr;
-    const float* g_a = (const float*)sp.gate_wn_sq;
-    const float* g_c = (const float*)sp.gate_pair_dot;
-    const float* u_a = (const float*)sp.up_wn_sq;
-    const float* u_c = (const float*)sp.up_pair_dot;
+    // per-k 커널은 가중치 통계를 쓰지 않는다 — 포인터를 비워 아래 오프셋 산술·prefetch가
+    // 전부 건너뛰게 한다 (테이블이 주입되지 않았을 수도 있다).
+    const float* g_a = kMaskPerK ? nullptr : (const float*)sp.gate_wn_sq;
+    const float* g_c = kMaskPerK ? nullptr : (const float*)sp.gate_pair_dot;
+    const float* u_a = kMaskPerK ? nullptr : (const float*)sp.up_wn_sq;
+    const float* u_c = kMaskPerK ? nullptr : (const float*)sp.up_pair_dot;
     const float* g_t = (const float*)sp.thr_gate;
     const float* u_t = (const float*)sp.thr_up;
 
@@ -732,10 +754,10 @@ class AMX_MOE_BASE {
           // 오프셋은 행 기준 row_base다 (균일 밴드에서는 e*rows와 같다).
           const size_t g_off = (size_t)config_.gate_row_base(e);
           const size_t u_off = (size_t)config_.up_row_base(e);
-          const float* ga = g_a + g_off;
-          const float* gc = g_c + g_off / 2;
-          const float* ua = u_a + u_off;
-          const float* uc = u_c + u_off / 2;
+          const float* ga = g_a ? g_a + g_off : nullptr;
+          const float* gc = g_c ? g_c + g_off / 2 : nullptr;
+          const float* ua = u_a ? u_a + u_off : nullptr;
+          const float* uc = u_c ? u_c + u_off / 2 : nullptr;
 
           if (do_up) {
             prefetch_prep_inputs(config_.partial.up, e, x_full, H, ua, uc, sparse);
@@ -744,7 +766,7 @@ class AMX_MOE_BASE {
             if (!sparse) {
               return;
             }
-            build_pair_mask(xu, config_.up_k(e), config_.up_k_real(e), ua, uc,
+            build_mask(xu, config_.up_k(e), config_.up_k_real(e), ua, uc,
                             thr_of(u_t, e, sp.ng, sp.grid, s_up[j]), m_pair_mask_up_[e].data());
             if constexpr (kHasPlanEncoder) {
               amx::build_plan_for<T>(m_pair_mask_up_[e].data(), xu, config_.up_k(e),
@@ -755,8 +777,8 @@ class AMX_MOE_BASE {
           }
 
           prefetch_prep_inputs(config_.partial.gate, e, x_full, H, ga, gc, sparse);
-          if (!dual && sparse) {
-            // up은 gate의 행을 공유한다 — 테이블만 따로 든다.
+          if (!dual && sparse && ua) {
+            // up은 gate의 행을 공유한다 — 테이블만 따로 든다 (per-k 커널은 테이블이 없다).
             prefetch_bytes(ua, (size_t)config_.up_k(e) * sizeof(float));
             prefetch_bytes(uc, (size_t)(config_.up_k(e) / 2) * sizeof(float));
           }
@@ -766,7 +788,7 @@ class AMX_MOE_BASE {
           if (!sparse) {
             return;
           }
-          build_pair_mask(xg, config_.gate_k(e), config_.gate_k_real(e), ga, gc,
+          build_mask(xg, config_.gate_k(e), config_.gate_k_real(e), ga, gc,
                           thr_of(g_t, e, sp.ng, sp.grid, s_gate[j]), m_pair_mask_gate_[e].data());
           if constexpr (kHasPlanEncoder) {
             // 마스크(정책, 절대 k)를 커널의 자료구조로 인코딩한다 — expert당
@@ -776,7 +798,7 @@ class AMX_MOE_BASE {
                                    config_.intermediate_size);
           }
           if (!dual) {
-            build_pair_mask(xg, config_.up_k(e), config_.up_k_real(e), ua, uc,
+            build_mask(xg, config_.up_k(e), config_.up_k_real(e), ua, uc,
                             thr_of(u_t, e, sp.ng, sp.grid, s_up[j]), m_pair_mask_up_[e].data());
             if constexpr (kHasPlanEncoder) {
               amx::build_plan_for<T>(m_pair_mask_up_[e].data(), xg, config_.up_k(e),
@@ -793,8 +815,8 @@ class AMX_MOE_BASE {
     const int qlen = 1;
     const auto& sp = config_.partial.sparsity;
     const bool sparse = sp.enabled && weights != nullptr;
-    const float* d_a = (const float*)sp.down_wn_sq;
-    const float* d_c = (const float*)sp.down_pair_dot;
+    const float* d_a = kMaskPerK ? nullptr : (const float*)sp.down_wn_sq;
+    const float* d_c = kMaskPerK ? nullptr : (const float*)sp.down_pair_dot;
     const float* d_t = (const float*)sp.thr_down;
     const int act_row = config_.n_total();  // act의 slot 행 stride = down K 축 길이
 
@@ -812,8 +834,8 @@ class AMX_MOE_BASE {
             return;
           }
           const size_t off = (size_t)config_.down_row_base(e);
-          const float* da = d_a + off;
-          const float* dc = d_c + off / 2;
+          const float* da = d_a ? d_a + off : nullptr;
+          const float* dc = d_c ? d_c + off / 2 : nullptr;
           const ggml_bf16_t* row = act + (size_t)j * act_row;
           prefetch_prep_inputs(config_.partial.down, e, row, act_row, da, dc, sparse);
           const ggml_bf16_t* src = dense_rows(config_.partial.down, e, row, m_local_input_ptr_[e]);
@@ -821,7 +843,7 @@ class AMX_MOE_BASE {
           if (!sparse) {
             return;
           }
-          build_pair_mask(src, config_.down_k(e), config_.down_k_real(e), da, dc,
+          build_mask(src, config_.down_k(e), config_.down_k_real(e), da, dc,
                           thr_of(d_t, e, sp.ng, sp.grid, s_down[j]), m_pair_mask_down_[e].data());
           if constexpr (kHasPlanEncoder) {
             amx::build_plan_for<T>(m_pair_mask_down_[e].data(), src, config_.down_k(e),

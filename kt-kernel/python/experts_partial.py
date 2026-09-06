@@ -55,6 +55,10 @@ _PARTIAL_MOE_CLASSES = {
     # 배율은 128×128 블록당 fp32 하나(`scale_inv`, n-major). 노드 N shard 256 배수, K 128 배수.
     # prefill은 GPU KT_TILE8 로더가 slab을 읽는다.
     "kt_tile_k2_fp8b128": lambda: kt_kernel_ext.moe.TileK2FP8B128_MOE,
+    # k=1 형제 (tile_k1_fp8b128): 64 B 라인 = k 한 행, **per-k 마스크**(score k1: |x| >= thr).
+    # 같은 입력 텐서·같은 slab 기하; sparsity 테이블은 thr 곡선 셋만 받는다 (wn_sq/pair_dot 불필요).
+    # prefill은 GPU KT_TILE8_K1 로더가 slab을 읽는다.
+    "kt_tile_k1_fp8b128": lambda: kt_kernel_ext.moe.TileK1FP8B128_MOE,
 }
 
 # 커널 키 → (weight dtype, 원소당 바이트 분모, 배율 dtype 또는 None, 배율 원소당 weight 원소 수,
@@ -66,6 +70,7 @@ _WEIGHT_FORMAT = {
     "kt_amx_fp4": (torch.uint8, 2, torch.bfloat16, 32, 32),
     "kt_tile_k2_mxfp4": (torch.uint8, 2, torch.bfloat16, 32, 32),
     "kt_tile_k2_fp8b128": (torch.uint8, 1, torch.float32, 128 * 128, 128),
+    "kt_tile_k1_fp8b128": (torch.uint8, 1, torch.float32, 128 * 128, 128),
 }
 FP4_GROUP_SIZE = 32
 
@@ -108,7 +113,8 @@ class PartialMoEWrapper:
         kt_tile_k2_fp8b128은 weight가 e4m3 바이트 + 배율 fp32(128×128 블록당 1, n-major
         `scale_inv`).
 
-        키 9개 전부 필요하고 전부 fp32 contiguous CPU여야 한다:
+        페어 마스크 커널(k2wl2)은 키 9개 전부, per-k 커널(`mask_per_k`, score k1)은
+        thr_gate/thr_up/thr_down 셋만 필요하다 (나머지가 와도 무시). 전부 fp32 contiguous CPU:
           gate_wn_sq/up_wn_sq       [E, gateup_k]    = wn^2
           gate_pair_dot/up_pair_dot [E, gateup_k/2]  = 인접열 내적
           down_wn_sq [E, down_k] / down_pair_dot [E, down_k/2]
@@ -173,21 +179,34 @@ class PartialMoEWrapper:
         self._pending = None  # 소스 텐서 해제 — 이후 소유권은 C++ (계약 ③)
 
     # (키, 축 종류, 나눔) — 축 "grid"는 밴드와 무관한 threshold 곡선이다.
-    _SPARSITY_KEYS = (
+    _THR_KEYS = (
+        ("thr_gate", "grid", 1),
+        ("thr_up", "grid", 1),
+        ("thr_down", "grid", 1),
+    )
+    _SCORE_KEYS = (
         ("gate_wn_sq", "gate", 1),
         ("gate_pair_dot", "gate", 2),
         ("up_wn_sq", "up", 1),
         ("up_pair_dot", "up", 2),
         ("down_wn_sq", "down", 1),
         ("down_pair_dot", "down", 2),
-        ("thr_gate", "grid", 1),
-        ("thr_up", "grid", 1),
-        ("thr_down", "grid", 1),
     )
+    _SPARSITY_KEYS = _SCORE_KEYS + _THR_KEYS  # 페어 마스크 커널의 전체 집합 (하위 호환 이름)
+
+    @property
+    def mask_per_k(self) -> bool:
+        """이 커널의 Seam B 마스크가 per-k(score k1)인가. C++ 클래스가 소유한 사실을 그대로 읽는다."""
+        return bool(getattr(self._moe_class, "mask_per_k", False))
+
+    def sparsity_keys(self):
+        """이 커널이 요구하는 sparsity 테이블 키 표 (키, 축, 나눔)."""
+        return self._THR_KEYS if self.mask_per_k else self._SPARSITY_KEYS
 
     def _install_sparsity(self, cfg, tables: dict) -> None:
         """테이블 검증 + config 포인터 설치. 참조는 self가 영구 보관한다."""
-        missing = [n for n, _, _ in self._SPARSITY_KEYS if n not in tables]
+        keys = self.sparsity_keys()
+        missing = [n for n, _, _ in keys if n not in tables]
         if missing:
             raise ValueError(f"sparsity_tables missing keys: {missing}")
         sp = cfg.partial.sparsity
@@ -203,7 +222,7 @@ class PartialMoEWrapper:
                 "down": _k_total(cfg.partial.down, cfg.expert_num),
                 "grid": cfg.expert_num * sp.ng}
         kept = {}
-        for name, band, div in self._SPARSITY_KEYS:
+        for name, band, div in keys:
             t = tables[name]
             want = rows[band] // div
             if (t.dtype != torch.float32 or t.numel() != want

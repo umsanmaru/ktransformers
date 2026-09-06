@@ -16,12 +16,20 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "llama.cpp/ggml-impl.h"  // ggml_bf16_t (아래 trait의 decltype이 쓴다)
+
 namespace amx {
 
 /// 절대 k 기준 keep 마스크. uint16 하나가 연속된 32 k를 덮고, 비트 j가
 /// k-페어 (32t + 2j, 32t + 2j + 1)을 유지한다. 어떤 packing도 참조하지 않는다
 /// — 마스크는 "어떤 k가 살아남는가"이고 그것은 활성값과 임계값의 성질이다.
 using PairMask = uint16_t;  // mask[k / 32]
+
+/// 절대 k 기준 **per-k** keep 마스크. uint32 하나가 연속된 32 k를 덮고, 비트 j가
+/// k = 32t + j 하나를 유지한다. 페어 마스크와 같은 격자(32-k 워드)라 moe_base의
+/// 워드 수 산정(k / K_STEP)이 두 마스크에 같이 맞는다. skip 단위가 k 한 행인 커널
+/// (tile_k1 계열)이 요구한다 — 판정은 `|x_k| >= thr` 하나뿐이고 가중치 통계를 쓰지 않는다.
+using KMask = uint32_t;  // mask[k / 32]
 
 /// 커널이 자기 blocking으로 인코딩한 결과. nullptr 필드는 dense를 뜻한다.
 struct ActivationPlan {
@@ -39,6 +47,14 @@ struct ActivationPlan {
 
   bool empty() const { return npairs == 0; }
 };
+
+/// 이 커널이 per-k 마스크(`KMask`)를 요구하는가. 커널이 `static constexpr bool
+/// kMaskPerK = true`를 선언하면 참이고, 선언이 없으면 페어 마스크(`PairMask`)다 —
+/// 기존 커널은 전부 무선언이라 무변경으로 페어 경로에 남는다.
+template <class K, class = void>
+struct mask_per_k : std::false_type {};
+template <class K>
+struct mask_per_k<K, std::enable_if_t<K::kMaskPerK>> : std::true_type {};
 
 /// 이 커널의 `build_plan`이 슬랩 n을 받는가 (= 부분 n-블록을 지원하는가).
 /// 지원하는 커널만 꼬리 오프셋 표를 만들 수 있고, 나머지는 5인자 서명 그대로다
@@ -61,6 +77,16 @@ inline void build_plan_for(const PairMask* mask, const ggml_bf16_t* x, int k, vo
     (void)n_slab;
     K::build_plan(mask, x, k, arena, out);
   }
+}
+
+/// per-k 마스크 커널용 창구. 꼬리(부분 n-블록) 표는 per-k 커널이 아직 지원하지
+/// 않으므로 5인자 서명만 있다 — 슬랩 n은 받되 쓰지 않는다 (호출부 서명 통일).
+template <class K>
+inline void build_plan_for(const KMask* mask, const ggml_bf16_t* x, int k, void* arena, ActivationPlan* out,
+                           int n_slab) {
+  static_assert(mask_per_k<K>::value, "build_plan_for(KMask*) needs a per-k kernel (kMaskPerK)");
+  (void)n_slab;
+  K::build_plan(mask, x, k, arena, out);
 }
 
 }  // namespace amx

@@ -12,6 +12,10 @@
  *   1 < m (소배치)    — 토큰 루프 (dense plan per token). prefill(m ≫ 1)은 sglang이 GPU(KT_TILE8
  *                       로더)로 보낸다 — 이 operator의 `mat_mat`은 존재하지 않는다.
  *
+ * 템플릿 인자 T로 `GemmKernelTileK1FP8B128`(k=1 타일, per-k 마스크 — la/tile_k1_fp8b128.hpp)도 그대로
+ * 인스턴스화된다. 두 커널은 BufferB 크기·배율 pack·slab 기하가 같고 그룹 안 바이트 순열과 마스크
+ * 종류만 다르다 — 마스크 분기는 moe_base(`kMaskPerK`)가 한다.
+ *
  * 이 operator는 **Prism partial 전용**이다: 타일 레이아웃은 GPU가 제자리 읽는 cold slab의
  * 형태이고, 비-partial(kt 자체 MoE) 경로는 원본 `AMX_FP8_MOE_TP`가 담당한다.
  */
@@ -19,6 +23,7 @@
 #define CPUINFER_OPERATOR_TILE_FP8_MOE_H
 
 #include "fp8-moe.hpp"
+#include "la/tile_k1_fp8b128.hpp"
 #include "la/tile_k2_fp8b128.hpp"
 
 template <class T = amx::GemmKernelTileK2FP8B128>
@@ -174,7 +179,7 @@ inline void fp8_tile_tp_load_weights(TPM& self) {
   auto& tps = self.tps;
   auto pool = config.pool;
   const uint64_t* physical_to_logical_map = (const uint64_t*)config.physical_to_logical_map;
-  const size_t B = amx::GemmKernelTileK2FP8B128::SCALE_BLK;
+  const size_t B = KTF8_BLK;  // 128 — k2/k1 타일 커널 공통 배율 블록
 
   if (config.gate_proj == nullptr || config.gate_scale == nullptr)
     throw std::runtime_error("TILE_FP8_MOE_TP: needs packed e4m3 weights + fp32 block scales");

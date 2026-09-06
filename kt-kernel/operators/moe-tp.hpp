@@ -301,6 +301,15 @@ class TP_MOE_Common : public MoE_Interface {
   // 축 N-분할로 동형 구현 예정). routing weight 인자도 없다 (가중은 GPU
   // rejoin). T가 forward_gateup_partial을 제공할 때만 인스턴스화되는
   // 템플릿-지연 메서드다 (llamafile 등 미지원 백엔드는 바인딩하지 않음).
+  // 노드 인스턴스 타입 T의 마스크 종류 (Seam B). 선언이 없는 백엔드는 페어(false).
+  static constexpr bool kMaskPerK() {
+    if constexpr (requires { T::kMaskPerK; }) {
+      return (bool)T::kMaskPerK;
+    } else {
+      return false;
+    }
+  }
+
   void forward_gateup_partial(int* qlen_ptr, int k, const int64_t* expert_ids, const void* input, void* out,
                               const float* weights = nullptr) {
     if (weights_loaded == false) [[unlikely]] {
@@ -328,7 +337,9 @@ class TP_MOE_Common : public MoE_Interface {
       if (qlen != 1) {
         throw std::runtime_error("forward_gateup_partial: sparsity is decode-only (qlen must be 1)");
       }
-      if (!sp_gu.gate_wn_sq || !sp_gu.gate_pair_dot || !sp_gu.up_wn_sq || !sp_gu.up_pair_dot) {
+      // 점수 테이블(wn²/pair_dot)은 페어 마스크(k2wl2) 커널만 읽는다. per-k 커널(kMaskPerK,
+      // score k1 = |x| >= thr)은 thr 곡선만 필요하므로 테이블 없음이 정상이다.
+      if (!kMaskPerK() && (!sp_gu.gate_wn_sq || !sp_gu.gate_pair_dot || !sp_gu.up_wn_sq || !sp_gu.up_pair_dot)) {
         throw std::runtime_error("forward_gateup_partial: sparsity enabled but gate/up tables are null");
       }
       if (!sp_gu.thr_gate || !sp_gu.thr_up) {
@@ -371,7 +382,7 @@ class TP_MOE_Common : public MoE_Interface {
       if (qlen != 1) {
         throw std::runtime_error("forward_down_partial: sparsity is decode-only (qlen must be 1)");
       }
-      if (!sp_dn.down_wn_sq || !sp_dn.down_pair_dot || !sp_dn.thr_down) {
+      if ((!kMaskPerK() && (!sp_dn.down_wn_sq || !sp_dn.down_pair_dot)) || !sp_dn.thr_down) {
         throw std::runtime_error("forward_down_partial: sparsity enabled but down tables are null");
       }
       if (sp_dn.ng <= 1 || sp_dn.grid <= 0.0f) {
