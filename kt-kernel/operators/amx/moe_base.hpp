@@ -34,6 +34,7 @@
 #include "../moe-tp.hpp"
 #include "la/act_plan.hpp"
 #include "k_mask.hpp"
+#include "la/sw_prefetch.hpp"
 #include "pair_mask.hpp"
 #include "la/amx.hpp"
 #include "llama.cpp/ggml.h"
@@ -575,8 +576,9 @@ class AMX_MOE_BASE {
     char* d = reinterpret_cast<char*>(dst);
     const size_t bytes = n * sizeof(ggml_bf16_t);
     size_t i = 0;
+    const bool pf = amx::sw_prefetch_enabled();  // KT_SW_PREFETCH=0 → plain copy
     for (; i + 64 <= bytes; i += 64) {
-      if (i + AHEAD < bytes) _mm_prefetch(s + i + AHEAD, _MM_HINT_T0);
+      if (pf && i + AHEAD < bytes) _mm_prefetch(s + i + AHEAD, _MM_HINT_T0);
       avx512_copy_32xbf16(reinterpret_cast<__m512i*>(const_cast<char*>(s + i)),
                           reinterpret_cast<__m512i*>(d + i));
     }
@@ -584,6 +586,7 @@ class AMX_MOE_BASE {
   }
 
   static inline void prefetch_bytes(const void* p, size_t bytes) {
+    if (!amx::sw_prefetch_enabled()) return;  // KT_SW_PREFETCH=0 ablation
     const char* c = reinterpret_cast<const char*>(p);
     const char* end = c + bytes;
     for (; c < end; c += 64) {

@@ -166,7 +166,8 @@ struct GemmKernelTileK2BF16 : GemmKernel224BF16RowMajorNC {
   /// 이 변종이 측정 우승자다.
   static void super_block(const ggml_bf16_t* W, float* ys, const uint32_t* koff, const uint32_t* pval,
                           const uint32_t* seg, int ncols, int npairs) {
-    Cursor cu = cursor_start(seg, ncols, npairs, PF_DIST);
+    // KT_SW_PREFETCH=0 (ablation): start the cursor dead so no prefetch is ever issued.
+    Cursor cu = cursor_start(seg, ncols, sw_prefetch_enabled() ? npairs : 0, PF_DIST);
     for (int c = 0; c < ncols; c++) {
       const int jlo = (int)seg[c], jhi = (int)seg[c + 1];
       if (jlo == jhi) continue;
@@ -194,7 +195,7 @@ struct GemmKernelTileK2BF16 : GemmKernel224BF16RowMajorNC {
   static void super_block_partial(const ggml_bf16_t* W, float* ys, const uint32_t* koff,
                                   const uint32_t* pval, const uint32_t* seg, int ncols, int npairs,
                                   int ngroup) {
-    Cursor cu = cursor_start(seg, ncols, npairs, PF_DIST, ngroup);
+    Cursor cu = cursor_start(seg, ncols, sw_prefetch_enabled() ? npairs : 0, PF_DIST, ngroup);
     for (int c = 0; c < ncols; c++) {
       const int jlo = (int)seg[c], jhi = (int)seg[c + 1];
       if (jlo == jhi) continue;
