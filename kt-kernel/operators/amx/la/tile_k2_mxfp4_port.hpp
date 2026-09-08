@@ -198,7 +198,7 @@ static inline int ktm4_build_plan(const uint16_t *mask, const uint16_t *x, int K
   return np;
 }
 
-#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512BF16__)
+#if defined(__AVX512F__) && defined(__AVX512BW__)
 
 /* Consumption-order cursor over (column, n-group of 4, kept pair) lines. */
 typedef struct {
@@ -323,7 +323,7 @@ static inline void ktm4_gemv(const uint8_t *W, const uint8_t *S,
 }
 
 #undef KTM4_PF
-#endif /* AVX512F && AVX512BW && AVX512BF16 */
+#endif /* AVX512F && AVX512BW */
 
 #ifdef __cplusplus
 }

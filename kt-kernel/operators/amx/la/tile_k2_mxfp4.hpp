@@ -142,7 +142,7 @@ struct GemmKernelTileK2MXFP4 {
   static void gemv_row(int m, int t, int n, int k, int n0, int n1, BufferB* bb, BufferC* bc,
                        const ActivationPlan* plan) {
     assert(n % N_BLOCK == 0 && n0 % N_BLOCK == 0 && n1 % N_BLOCK == 0);
-#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512BF16__)
+#if defined(__AVX512F__) && defined(__AVX512BW__)
     for (int nb = n0; nb < n1; nb += N_BLOCK) {
       float* y = bc->get_submat(m, n, t, nb) - nb;  // y + nb == 이 super의 출력
       ktm4_gemv(bb->b, bb->s, plan->koff, plan->pval, plan->seg, plan->npairs, n, k, y, nb, nb + N_BLOCK, PF_DIST);
@@ -150,7 +150,7 @@ struct GemmKernelTileK2MXFP4 {
 #else
     (void)m;
     (void)t; (void)n; (void)k; (void)n0; (void)n1; (void)bb; (void)bc; (void)plan;
-    throw std::runtime_error("TileK2MXFP4 needs AVX512F/BW/BF16");
+    throw std::runtime_error("TileK2MXFP4 needs AVX512F/BW");
 #endif
   }
 

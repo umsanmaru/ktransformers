@@ -152,7 +152,7 @@ static inline int ktf8_build_plan(const uint16_t *mask, const uint16_t *x, int K
   return np;
 }
 
-#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512BF16__)
+#if defined(__AVX512F__) && defined(__AVX512BW__)
 
 typedef struct {
   int c, g, j, live;
@@ -252,7 +252,7 @@ static inline void ktf8_gemv(const uint8_t *W, const float *S,
 }
 
 #undef KTF8_PF
-#endif /* AVX512F && AVX512BW && AVX512BF16 */
+#endif /* AVX512F && AVX512BW */
 
 #ifdef __cplusplus
 }

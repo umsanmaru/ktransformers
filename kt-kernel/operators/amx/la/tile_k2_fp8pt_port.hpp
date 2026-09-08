@@ -32,7 +32,7 @@
 extern "C" {
 #endif
 
-#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512BF16__)
+#if defined(__AVX512F__) && defined(__AVX512BW__)
 
 #define KTF8PT_PF(addr) _mm_prefetch((const char *)(addr), _MM_HINT_T1)
 
@@ -112,7 +112,7 @@ static inline void ktf8pt_gemv(const uint8_t *W, float s, const uint32_t *koff,
 }
 
 #undef KTF8PT_PF
-#endif /* AVX512F && AVX512BW && AVX512BF16 */
+#endif /* AVX512F && AVX512BW */
 
 #ifdef __cplusplus
 }

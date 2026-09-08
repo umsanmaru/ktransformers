@@ -19,6 +19,12 @@
 #ifndef __m512bh
 #define __m512bh __m512i
 #endif
+#ifndef __m256bh
+#define __m256bh __m256i
+#endif
+#ifndef __m128bh
+#define __m128bh __m128i
+#endif
 
 // BF16 emulation via AVX512F
 static ALWAYS_INLINE __m512 _mm512_dpbf16_ps_emulated(__m512 src, __m512i a, __m512i b) {
@@ -34,6 +40,44 @@ static ALWAYS_INLINE __m512 _mm512_dpbf16_ps_emulated(__m512 src, __m512i a, __m
 
 #ifndef _mm512_dpbf16_ps
 #define _mm512_dpbf16_ps _mm512_dpbf16_ps_emulated
+#endif
+
+// FP32 -> BF16 변환 에뮬레이션 (VCVTNE2PS2BF16 / VCVTNEPS2BF16 대체).
+// 반올림은 RNE — `la/utils.hpp`의 avx512_32xfp32_to_32xbf16 폴백과 같은 식이라
+// BF16 있는 빌드와 없는 빌드가 같은 값을 낸다 (NaN 페이로드는 제외).
+static ALWAYS_INLINE __m512i _kt_bf16_rne_epi32(__m512 v) {
+  const __m512i i = _mm512_castps_si512(v);
+  const __m512i bias = _mm512_add_epi32(_mm512_set1_epi32(0x7FFF),
+                                        _mm512_and_si512(_mm512_srli_epi32(i, 16), _mm512_set1_epi32(1)));
+  return _mm512_srli_epi32(_mm512_add_epi32(i, bias), 16);
+}
+
+// dst.word[0..15] = cvt(b), dst.word[16..31] = cvt(a)  (Intel VCVTNE2PS2BF16 순서)
+static ALWAYS_INLINE __m512i _mm512_cvtne2ps_pbh_emulated(__m512 a, __m512 b) {
+  const __m256i lo = _mm512_cvtepi32_epi16(_kt_bf16_rne_epi32(b));
+  const __m256i hi = _mm512_cvtepi32_epi16(_kt_bf16_rne_epi32(a));
+  return _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
+}
+
+static ALWAYS_INLINE __m256i _mm512_cvtneps_pbh_emulated(__m512 a) {
+  return _mm512_cvtepi32_epi16(_kt_bf16_rne_epi32(a));
+}
+
+static ALWAYS_INLINE __m128i _mm256_cvtneps_pbh_emulated(__m256 a) {
+  const __m256i i = _mm256_castps_si256(a);
+  const __m256i bias = _mm256_add_epi32(_mm256_set1_epi32(0x7FFF),
+                                        _mm256_and_si256(_mm256_srli_epi32(i, 16), _mm256_set1_epi32(1)));
+  return _mm256_cvtepi32_epi16(_mm256_srli_epi32(_mm256_add_epi32(i, bias), 16));
+}
+
+#ifndef _mm512_cvtne2ps_pbh
+#define _mm512_cvtne2ps_pbh _mm512_cvtne2ps_pbh_emulated
+#endif
+#ifndef _mm512_cvtneps_pbh
+#define _mm512_cvtneps_pbh _mm512_cvtneps_pbh_emulated
+#endif
+#ifndef _mm256_cvtneps_pbh
+#define _mm256_cvtneps_pbh _mm256_cvtneps_pbh_emulated
 #endif
 #endif
 
