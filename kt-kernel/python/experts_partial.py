@@ -44,6 +44,10 @@ _PARTIAL_MOE_CLASSES = {
     # n-contiguous weight layout: prefill은 상속받은 AMX amx_kernel, sparse
     # decode는 tile_k2의 gemv_slab — 두 경로가 weight 한 벌을 공유한다.
     "kt_tile_k2_bf16": lambda: kt_kernel_ext.moe.TileK2BF16_MOE,
+    # 그 no-SW-pf 형제 (tile_k2.hpp `GemmKernelTileK2BF16NoPF`): 소비 커서·prefill B-panel·
+    # prep/export 보조 프리페치가 컴파일 타임에 빠진 같은 커널. 레이아웃·plan·자산·정렬이
+    # 전부 같아서 plan의 커널 키만 바꿔 "SW 프리페처 없음" ablation을 돌린다.
+    "kt_tile_k2_bf16_nopf": lambda: kt_kernel_ext.moe.TileK2BF16NoPF_MOE,
     # MXFP4 g32 (e2m1 nibble 행 [N, k/2] + bf16 배율 [N, k/32]) — dense 전용 (sparse plan 거절).
     # 저장은 kt BufferBInt4KGroupImpl(행우선 nibble + fp32 배율)이고 GPU cold 읽기는 그 레이아웃을
     # 제자리 해석한다 (sglang prism_grouped_mxfp4.cuh KT_FP4 로더).
@@ -71,6 +75,7 @@ _PARTIAL_MOE_CLASSES = {
 _WEIGHT_FORMAT = {
     "kt_amx_bf16": (torch.bfloat16, 1, None, 1, 0),
     "kt_tile_k2_bf16": (torch.bfloat16, 1, None, 1, 0),
+    "kt_tile_k2_bf16_nopf": (torch.bfloat16, 1, None, 1, 0),
     "kt_amx_fp4": (torch.uint8, 2, torch.bfloat16, 32, 32),
     "kt_tile_k2_mxfp4": (torch.uint8, 2, torch.bfloat16, 32, 32),
     "kt_tile_k2_fp8b128": (torch.uint8, 1, torch.float32, 128 * 128, 128),

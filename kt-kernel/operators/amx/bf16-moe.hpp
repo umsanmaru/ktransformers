@@ -146,12 +146,15 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
         throw std::runtime_error(sparse_unavailable_message());
       }
     }
-    // Use vec_mul/mat_mul (no group_size)
+    // dense 경로. `amx::mat_mul`/`vec_mul`은 buffer 타입으로 오버로드를 고르는데,
+    // 그것으로는 **버퍼를 공유하는 커널 형제**를 가릴 수 없다 (tile_k2의 no-SW-pf
+    // 형제가 그렇다 — BufferB 타입이 같다). 그래서 T로 dispatch하는 템플릿을 직접
+    // 부른다: 두 오버로드가 하던 일이 정확히 이 두 인스턴스화다.
     // K 치수는 접근자 경유 — partial 인스턴스면 밴드 크기, 아니면 full (동일)
     if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
-      amx::mat_mul(m, config_.intermediate_size, gu_k, ba, bb, bc, ith, nth);
+      amx::float_mat_vec<T, true>(m, config_.intermediate_size, gu_k, ba.get(), bb.get(), bc.get(), ith, nth);
     } else {
-      amx::vec_mul(m, config_.intermediate_size, gu_k, ba, bb, bc, ith, nth);
+      amx::float_mat_vec<T, false>(m, config_.intermediate_size, gu_k, ba.get(), bb.get(), bc.get(), ith, nth);
     }
   }
 
@@ -174,11 +177,11 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
       }
     }
     if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
-      amx::mat_mul(m, config_.down_n(), config_.down_k(expert_idx), down_ba_[expert_idx], down_bb_[expert_idx],
-                   down_bc_[expert_idx], ith, nth);
+      amx::float_mat_vec<T, true>(m, config_.down_n(), config_.down_k(expert_idx), down_ba_[expert_idx].get(),
+                                  down_bb_[expert_idx].get(), down_bc_[expert_idx].get(), ith, nth);
     } else {
-      amx::vec_mul(m, config_.down_n(), config_.down_k(expert_idx), down_ba_[expert_idx], down_bb_[expert_idx],
-                   down_bc_[expert_idx], ith, nth);
+      amx::float_mat_vec<T, false>(m, config_.down_n(), config_.down_k(expert_idx), down_ba_[expert_idx].get(),
+                                   down_bb_[expert_idx].get(), down_bc_[expert_idx].get(), ith, nth);
     }
   }
 

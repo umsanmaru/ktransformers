@@ -12,6 +12,16 @@
  * kt 원본 `BufferBBF16Impl`은 건드리지 않는다 — 원본 커널은 비트 단위로
  * 그대로이고, 롤백은 템플릿 인자 하나다.
  *
+ * ## no-SW-pf 형제
+ *
+ * 커널은 `SwPf` 하나로 템플릿화돼 있고 두 인스턴스가 나온다:
+ * `GemmKernelTileK2BF16`(프리페치 있음, plan 키 `kt_tile_k2_bf16`)과
+ * `GemmKernelTileK2BF16NoPF`(없음, `kt_tile_k2_bf16_nopf`). 후자는 "SW 프리페처 없음"
+ * ablation 전용이고, 소비 커서와 prefill B-panel 프리페치(base `amx_kernel_pf<false>`),
+ * moe_base의 prep/export 보조 프리페치(`kSwPrefetch` 트레잇)까지 **컴파일 타임에** 빠진다.
+ * 가중치 레이아웃·plan·누산 순서가 같으므로 plan JSON의 커널 키 한 글자만 바꿔
+ * 같은 자산으로 A/B 한다 (예전 `KT_SW_PREFETCH` 런타임 스위치의 대체).
+ *
  * ## 이 커널이 이기는 이유
  *
  * 소프트웨어 프리페치 **커서**다. 커서는 전역 소비 순서 위의 lookahead이고,
@@ -43,13 +53,22 @@
 
 namespace amx {
 
-struct GemmKernelTileK2BF16 : GemmKernel224BF16RowMajorNC {
+/// `SwPf`: 소프트웨어 프리페치를 코드에 넣는가. `false` 인스턴스가 no-SW-pf 형제
+/// (`GemmKernelTileK2BF16NoPF`)이고, 커서·프리페치 명령·그 부기(簿記)가 전부
+/// `if constexpr`로 사라진다 — 실행 시 분기 하나도 남지 않는다. weight 레이아웃·
+/// plan 인코딩·누산 순서는 두 인스턴스가 **비트 단위로 같다** (BufferB 타입도
+/// 상속받은 하나를 공유하므로 slab·pack·GPU 로더도 그대로다).
+template <bool SwPf>
+struct GemmKernelTileK2BF16Impl : GemmKernel224BF16RowMajorNC {
   using Base = GemmKernel224BF16RowMajorNC;
   using BufferA = Base::BufferA;
   using BufferB = Base::BufferB;
   using BufferC = Base::BufferC;
 
-  static std::string name() { return "TILE_K2_BF16"; }
+  /// moe_base가 prep/export 보조 프리페치를 맞춰 끄는 근거 (없는 커널은 켜짐 취급).
+  static constexpr bool kSwPrefetch = SwPf;
+
+  static std::string name() { return SwPf ? "TILE_K2_BF16" : "TILE_K2_BF16_NOPF"; }
 
   /// 프리페치 거리 (소비 스트림의 64 B 라인 수). 측정 우승자, T1 힌트.
   static constexpr int PF_DIST = 128;
@@ -166,8 +185,7 @@ struct GemmKernelTileK2BF16 : GemmKernel224BF16RowMajorNC {
   /// 이 변종이 측정 우승자다.
   static void super_block(const ggml_bf16_t* W, float* ys, const uint32_t* koff, const uint32_t* pval,
                           const uint32_t* seg, int ncols, int npairs) {
-    // KT_SW_PREFETCH=0 (ablation): start the cursor dead so no prefetch is ever issued.
-    Cursor cu = cursor_start(seg, ncols, sw_prefetch_enabled() ? npairs : 0, PF_DIST);
+    [[maybe_unused]] Cursor cu = cursor_start(seg, ncols, SwPf ? npairs : 0, PF_DIST);
     for (int c = 0; c < ncols; c++) {
       const int jlo = (int)seg[c], jhi = (int)seg[c + 1];
       if (jlo == jhi) continue;
@@ -177,9 +195,11 @@ struct GemmKernelTileK2BF16 : GemmKernel224BF16RowMajorNC {
         float* yg = ys + GROUP_N * g;
         __m512 a0 = _mm512_loadu_ps(yg);
         for (int j = jlo; j < jhi; j++) {
-          if (cu.live) {
-            _mm_prefetch((const char*)(W + koff[cu.j] + (uint32_t)cu.g * GROUP_STRIDE), _MM_HINT_T1);
-            cursor_step(cu, seg, ncols);
+          if constexpr (SwPf) {
+            if (cu.live) {
+              _mm_prefetch((const char*)(W + koff[cu.j] + (uint32_t)cu.g * GROUP_STRIDE), _MM_HINT_T1);
+              cursor_step(cu, seg, ncols);
+            }
           }
           const __m512bh vv = (__m512bh)_mm512_set1_epi32((int)pval[j]);
           a0 = _mm512_dpbf16_ps(a0, vv, (__m512bh)_mm512_loadu_si512(W + koff[j] + go));
@@ -195,7 +215,7 @@ struct GemmKernelTileK2BF16 : GemmKernel224BF16RowMajorNC {
   static void super_block_partial(const ggml_bf16_t* W, float* ys, const uint32_t* koff,
                                   const uint32_t* pval, const uint32_t* seg, int ncols, int npairs,
                                   int ngroup) {
-    Cursor cu = cursor_start(seg, ncols, sw_prefetch_enabled() ? npairs : 0, PF_DIST, ngroup);
+    [[maybe_unused]] Cursor cu = cursor_start(seg, ncols, SwPf ? npairs : 0, PF_DIST, ngroup);
     for (int c = 0; c < ncols; c++) {
       const int jlo = (int)seg[c], jhi = (int)seg[c + 1];
       if (jlo == jhi) continue;
@@ -204,9 +224,11 @@ struct GemmKernelTileK2BF16 : GemmKernel224BF16RowMajorNC {
         float* yg = ys + GROUP_N * g;
         __m512 a0 = _mm512_loadu_ps(yg);
         for (int j = jlo; j < jhi; j++) {
-          if (cu.live) {
-            _mm_prefetch((const char*)(W + koff[cu.j] + (uint32_t)cu.g * GROUP_STRIDE), _MM_HINT_T1);
-            cursor_step(cu, seg, ncols, ngroup);
+          if constexpr (SwPf) {
+            if (cu.live) {
+              _mm_prefetch((const char*)(W + koff[cu.j] + (uint32_t)cu.g * GROUP_STRIDE), _MM_HINT_T1);
+              cursor_step(cu, seg, ncols, ngroup);
+            }
           }
           const __m512bh vv = (__m512bh)_mm512_set1_epi32((int)pval[j]);
           a0 = _mm512_dpbf16_ps(a0, vv, (__m512bh)_mm512_loadu_si512(W + koff[j] + go));
@@ -242,6 +264,21 @@ struct GemmKernelTileK2BF16 : GemmKernel224BF16RowMajorNC {
       }
     }
   }
+
+  /// prefill (m > 1)은 상속받은 AMX 커널이지만, B 패널 프리페치도 이 커널의
+  /// `SwPf`를 따라야 한다 — 그래서 base의 진입점을 가리고 템플릿 형태를 부른다.
+  /// `float_mat_vec<K>`가 `K::amx_kernel`을 부르므로 이 가림이 곧 dispatch다
+  /// (bf16-moe.hpp가 buffer 타입으로 고르는 `amx::mat_mul` 대신 `float_mat_vec<T>`를
+  /// 부르는 이유 — 두 인스턴스는 BufferB 타입을 공유하므로 오버로드로는 갈릴 수 없다).
+  static void amx_kernel(int m, int n, int k, int m_begin, int n_begin, int k_block_begin, float* c, BufferA* ba,
+                         BufferB* bb) {
+    Base::amx_kernel_pf<SwPf>(m, n, k, m_begin, n_begin, k_block_begin, c, ba, bb);
+  }
 };
+
+/// 측정 우승자 (프리페치 커서 있음) — plan 키 `kt_tile_k2_bf16`.
+using GemmKernelTileK2BF16 = GemmKernelTileK2BF16Impl<true>;
+/// 그 no-SW-pf 형제 — plan 키 `kt_tile_k2_bf16_nopf` ("SW 프리페처 없음" ablation).
+using GemmKernelTileK2BF16NoPF = GemmKernelTileK2BF16Impl<false>;
 
 }  // namespace amx
