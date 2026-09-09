@@ -109,6 +109,17 @@ class AMX_MOE_BASE {
   // 멤버들과 같은 접근 구역에 둔다.)
   static constexpr bool kHasPlanEncoder = requires { T::plan_arena_bytes(1); };
 
+  // 이 커널이 소프트웨어 프리페치를 쓰는가. 선언하지 않는 커널(대부분)은 켜짐이고,
+  // no-SW-pf 형제(`GemmKernelTileK2BF16NoPF`)만 false를 들고 온다 — 그 커널로 도는
+  // 인스턴스는 아래 prep/export 보조 프리페치까지 컴파일 타임에 빠져야 "프리페치 없음"이
+  // 커널 안에서만 참인 반쪽 ablation이 되지 않는다.
+  static constexpr bool kSwPrefetch = [] {
+    if constexpr (requires { T::kSwPrefetch; })
+      return (bool)T::kSwPrefetch;
+    else
+      return true;
+  }();
+
   void* plan_arena_for(int e, int slot) const {
     return (char*)m_plan_arena_ + (size_t)slot * m_plan_off_.back() + m_plan_off_[e];
   }
@@ -571,7 +582,9 @@ class AMX_MOE_BASE {
     const size_t bytes = n * sizeof(ggml_bf16_t);
     size_t i = 0;
     for (; i + 64 <= bytes; i += 64) {
-      if (i + AHEAD < bytes) _mm_prefetch(s + i + AHEAD, _MM_HINT_T0);
+      if constexpr (kSwPrefetch) {
+        if (i + AHEAD < bytes) _mm_prefetch(s + i + AHEAD, _MM_HINT_T0);
+      }
       avx512_copy_32xbf16(reinterpret_cast<__m512i*>(const_cast<char*>(s + i)),
                           reinterpret_cast<__m512i*>(d + i));
     }
@@ -579,6 +592,7 @@ class AMX_MOE_BASE {
   }
 
   static inline void prefetch_bytes(const void* p, size_t bytes) {
+    if constexpr (!kSwPrefetch) return;  // no-SW-pf 커널: 호출부까지 비게 된다
     const char* c = reinterpret_cast<const char*>(p);
     const char* end = c + bytes;
     for (; c < end; c += 64) {

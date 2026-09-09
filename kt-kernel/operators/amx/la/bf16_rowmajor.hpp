@@ -45,7 +45,9 @@
  *    the first m-block of a k-block streams the panel in. This is the same
  *    recipe GemmKernel224BF16 uses; see the comments there for why the gating
  *    and the depth are what they are. Without it this kernel is slower than
- *    GemmKernel224BF16 at small per-expert m.
+ *    GemmKernel224BF16 at small per-expert m. `amx_kernel_pf<false>` is the
+ *    prefetch-free entry point the no-SW-pf twin (tile_k2.hpp) prefills with;
+ *    `amx_kernel` itself always prefetches.
  *
  * Contract mirrors GemmKernel224BF16: same M/N/K_STEP of 32, same N_BLOCK and
  * K_BLOCK, same split_range_n semantics (nth must equal recommended_nth(n)),
@@ -290,8 +292,11 @@ struct GemmKernel224BF16RowMajorNC {
   using BufferB = BufferBBF16NContigImpl<GemmKernel224BF16RowMajorNC>;
   using BufferC = BufferCRowMajorFP32Impl<GemmKernel224BF16RowMajorNC>;
 
-  static void amx_kernel(int m, int n, int k, int m_begin, int n_begin, int k_block_begin, float* c, BufferA* ba,
-                         BufferB* bb) {
+  /// `SwPf == false`이면 B 패널 프리페치를 **코드에서** 뺀다 (no-SW-pf 형제 커널용,
+  /// tile_k2.hpp `GemmKernelTileK2BF16NoPF`). 기본 진입점 `amx_kernel`은 `SwPf = true`다.
+  template <bool SwPf>
+  static void amx_kernel_pf(int m, int n, int k, int m_begin, int n_begin, int k_block_begin, float* c, BufferA* ba,
+                            BufferB* bb) {
     const size_t lda = ba->stride * sizeof(dt);
     const size_t ldc = ((size_t)n + C_ROW_PAD) * sizeof(output_t);
 
@@ -301,17 +306,24 @@ struct GemmKernel224BF16RowMajorNC {
       GemmKernel224BF16::load_c(c, ldc);
     }
 
-    const bool prefetch_b = m_begin == 0;
-    // Elements between one k-step's strip run and the next one.
-    const int n_block_size = std::min((int)N_BLOCK, n - n_begin / N_BLOCK * N_BLOCK);
-    const size_t k_step_run = (size_t)n_block_size * K_STEP;
+    // Elements between one k-step's strip run and the next one. Both are the
+    // prefetch's own bookkeeping, so the no-pf instantiation never computes them.
+    [[maybe_unused]] bool prefetch_b = false;
+    [[maybe_unused]] size_t k_step_run = 0;
+    if constexpr (SwPf) {
+      prefetch_b = m_begin == 0;
+      const int n_block_size = std::min((int)N_BLOCK, n - n_begin / N_BLOCK * N_BLOCK);
+      k_step_run = (size_t)n_block_size * K_STEP;
+    }
 
     for (int k_begin = 0; k_begin < K_BLOCK && k_block_begin + k_begin < k; k_begin += K_STEP) {
       dt* b = bb->get_submat(n, k, n_begin, k_block_begin + k_begin);
-      if (prefetch_b) {
-        const char* p = reinterpret_cast<const char*>(b + B_PREFETCH_K_STEPS * k_step_run);
-        for (int i = 0; i < B_PREFETCH_LINES; i++) {
-          _mm_prefetch(p + i * 64, _MM_HINT_T1);
+      if constexpr (SwPf) {
+        if (prefetch_b) {
+          const char* p = reinterpret_cast<const char*>(b + B_PREFETCH_K_STEPS * k_step_run);
+          for (int i = 0; i < B_PREFETCH_LINES; i++) {
+            _mm_prefetch(p + i * 64, _MM_HINT_T1);
+          }
         }
       }
       GemmKernel224BF16::load_a(ba->get_submat(m, k, m_begin, k_block_begin + k_begin), lda);
@@ -320,6 +332,11 @@ struct GemmKernel224BF16RowMajorNC {
     }
 
     GemmKernel224BF16::store_c(c, ldc);
+  }
+
+  static void amx_kernel(int m, int n, int k, int m_begin, int n_begin, int k_block_begin, float* c, BufferA* ba,
+                         BufferB* bb) {
+    amx_kernel_pf<true>(m, n, k, m_begin, n_begin, k_block_begin, c, ba, bb);
   }
 
   // AVX512-BF16 fallback, used by vec_mul. The B tile-pair is contiguous

@@ -1042,6 +1042,10 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   // prefill은 상속받은 amx_kernel, sparse decode는 gemv_slab — weight 한 벌.
   bind_moe_module<AMX_BF16_MOE_TP<amx::GemmKernelTileK2BF16>, /*WithPartial=*/true>(moe_module,
                                                                                     "TileK2BF16_MOE");
+  // 같은 커널의 no-SW-pf 형제 ("SW 프리페처 없음" ablation): decode 커서·prefill B-panel·
+  // prep/export 보조 프리페치가 컴파일 타임에 빠진다. 레이아웃·plan·자산은 위와 동일하다.
+  bind_moe_module<AMX_BF16_MOE_TP<amx::GemmKernelTileK2BF16NoPF>, /*WithPartial=*/true>(
+      moe_module, "TileK2BF16NoPF_MOE");
   bind_moe_module<AMX_FP8_MOE_TP<amx::GemmKernel224FP8>>(moe_module, "AMXFP8_MOE");
   bind_moe_module<AMX_FP8_PERCHANNEL_MOE_TP<amx::GemmKernel224FP8PerChannel>>(moe_module, "AMXFP8PerChannel_MOE");
   // WithPartial: Prism cold 티어(mxfp4, dense) — forward_*_partial + cold_slab_views.
