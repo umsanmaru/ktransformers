@@ -52,6 +52,7 @@ static const bool _is_plain_ = false;
 #include "operators/amx/fp4-moe.hpp"             // MXFP4 MoE: FP4 E2M1 weights × BF16 activations
 #include "operators/amx/tile-mxfp4-moe.hpp"        // MXFP4 tile layout + sparse decode (Prism cold)
 #include "operators/amx/fp8-moe.hpp"             // FP8 MoE requires AVX512 BF16 support, with fallback for AVX512F+BW
+#include "operators/amx/tile-bf16-moe.hpp"         // bf16 k1 tile layout + per-k sparse decode (Prism cold)
 #include "operators/amx/tile-fp8-moe.hpp"          // FP8 b128 tile layout + sparse decode (Prism cold)
 #include "operators/amx/fp8-perchannel-moe.hpp"  // FP8 Per-Channel MoE for GLM-4.7-FP8
 #include "operators/amx/k2-moe.hpp"
@@ -623,6 +624,10 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
 }
 
 PYBIND11_MODULE(kt_kernel_ext, m) {
+#if defined(__x86_64__) && defined(USE_AMX_AVX_KERNEL)
+  // Resolve/validate the process-level override before any worker can use it.
+  m.attr("k2_bf16_pf_dist") = amx::GemmKernelTileK2BF16::prefetch_distance();
+#endif
 #if defined(HAVE_AMX)
   m.attr("__cpu_variant__") = "amx";
   m.attr("__int8_kernel__") = "amx-int8";
@@ -1049,6 +1054,9 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   // prep/export 보조 프리페치가 컴파일 타임에 빠진다. 레이아웃·plan·자산은 위와 동일하다.
   bind_moe_module<AMX_BF16_MOE_TP<amx::GemmKernelTileK2BF16NoPF>, /*WithPartial=*/true>(
       moe_module, "TileK2BF16NoPF_MOE");
+  bind_moe_module<AMX_BF16_MOE_TP<amx::GemmKernelTileK2BF16Impl<true, 640>>, true>(moe_module, "TileK2BF16N640_MOE");
+  bind_moe_module<AMX_BF16_MOE_TP<amx::GemmKernelTileK2BF16Impl<true, 1280>>, true>(moe_module, "TileK2BF16N1280_MOE");
+  bind_moe_module<AMX_BF16_MOE_TP<amx::GemmKernelTileK2BF16Impl<true, 3456>>, true>(moe_module, "TileK2BF16N3456_MOE");
   bind_moe_module<AMX_FP8_MOE_TP<amx::GemmKernel224FP8>>(moe_module, "AMXFP8_MOE");
   bind_moe_module<AMX_FP8_PERCHANNEL_MOE_TP<amx::GemmKernel224FP8PerChannel>>(moe_module, "AMXFP8PerChannel_MOE");
   // WithPartial: Prism cold 티어(mxfp4, dense) — forward_*_partial + cold_slab_views.
@@ -1064,9 +1072,16 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   // k=1 형제: 64 B 라인 = k 한 행, per-k 마스크(|x| >= thr, score k1). prefill은 GPU KT_TILE8_K1.
   bind_moe_module<TILE_FP8_MOE_TP<amx::GemmKernelTileK1FP8B128>, /*WithPartial=*/true>(moe_module,
                                                                                         "TileK1FP8B128_MOE");
+  // bf16 k=1 타일: 64 B 라인 = k 한 행 × 32 n, per-k 마스크(score k1). CPU prefill 없음
+  // (pack이 AMX 순열과 달라 mat_mul을 갖지 않는다 — tile-bf16-moe.hpp docstring).
+  bind_moe_module<TILE_BF16_MOE_TP<amx::GemmKernelTileK1BF16>, /*WithPartial=*/true>(moe_module,
+                                                                                     "TileK1BF16_MOE");
   // 같은 fp8 타일 레이아웃, 배율은 행렬당 fp32 1개 (Mistral-Medium-3.5 static-tensor FP8). k % 32.
   bind_moe_module<TILE_FP8_MOE_TP<amx::GemmKernelTileK2FP8PT>, /*WithPartial=*/true>(moe_module,
                                                                                      "TileK2FP8PT_MOE");
+  // 두 축의 교차: k=1 타일(per-k 마스크) + per-tensor 배율. Mistral-Medium-3.5의 score k1 경로.
+  bind_moe_module<TILE_FP8_MOE_TP<amx::GemmKernelTileK1FP8PT>, /*WithPartial=*/true>(moe_module,
+                                                                                     "TileK1FP8PT_MOE");
   bind_moe_module<AMX_MXFP8_MOE_TP<amx::GemmKernel224MXFP8SmallKGroup>>(moe_module, "AMXMXFP8_KGroup_MOE");
 #endif
 #if defined(__AVX512BF16__)

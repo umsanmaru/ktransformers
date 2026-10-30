@@ -40,6 +40,10 @@ def _k_total(ki, expert_num: int) -> int:
 # cpu_cold 커널 키 → ext 클래스. (키의 유효성 검증은 sglang prism kernels.py,
 # 실제 클래스 선택은 여기 — 라이브러리가 자기 클래스 목록을 소유한다)
 _PARTIAL_MOE_CLASSES = {
+    "kt_tile_k2_bf16_n640": lambda: kt_kernel_ext.moe.TileK2BF16N640_MOE,
+    "kt_tile_k2_bf16_n1280": lambda: kt_kernel_ext.moe.TileK2BF16N1280_MOE,
+    "kt_tile_k2_bf16_n3456": lambda: kt_kernel_ext.moe.TileK2BF16N3456_MOE,
+
     "kt_amx_bf16": lambda: kt_kernel_ext.moe.AMXBF16_MOE,
     # n-contiguous weight layout: prefill은 상속받은 AMX amx_kernel, sparse
     # decode는 tile_k2의 gemv_slab — 두 경로가 weight 한 벌을 공유한다.
@@ -63,16 +67,25 @@ _PARTIAL_MOE_CLASSES = {
     # 같은 입력 텐서·같은 slab 기하; sparsity 테이블은 thr 곡선 셋만 받는다 (wn_sq/pair_dot 불필요).
     # prefill은 GPU KT_TILE8_K1 로더가 slab을 읽는다.
     "kt_tile_k1_fp8b128": lambda: kt_kernel_ext.moe.TileK1FP8B128_MOE,
+    # bf16 k=1 타일: 같은 bf16 입력·같은 크기, 64 B 라인 = k 한 행 × 32 n, per-k 마스크.
+    # CPU prefill이 없다 (m > 1은 토큰 루프) — decode 전용 커널이다.
+    "kt_tile_k1_bf16": lambda: kt_kernel_ext.moe.TileK1BF16_MOE,
     # FP8 e4m3 **per-tensor** 배율 (Mistral-Medium-3.5 static-tensor FP8: weight_block_size null).
     # 코드 타일 레이아웃은 b128과 같고 배율은 proj당 fp32 [E] (expert = dense 슬롯당 스칼라 1개).
     # 노드 N shard 256 배수, K 32 배수 (128 제약 없음).
     "kt_tile_k2_fp8pt": lambda: kt_kernel_ext.moe.TileK2FP8PT_MOE,
+    # 그 per-k 형제 (k1 타일 + per-tensor 배율). 입력·배율 모양은 k2 pt와 같고 마스크만 per-k다.
+    "kt_tile_k1_fp8pt": lambda: kt_kernel_ext.moe.TileK1FP8PT_MOE,
 }
 
 # 커널 키 → (weight dtype, 원소당 바이트 분모, 배율 dtype 또는 None, 배율 원소당 weight 원소 수,
 #            quant group_size). 배율 개수는 "weight 원소 수 / scale_div"다 — mxfp4는 32-k 블록
 # 하나에 배율 1개(행마다)라 32, fp8 블록은 128×128이라 16384다.
 _WEIGHT_FORMAT = {
+    "kt_tile_k2_bf16_n640": (torch.bfloat16, 1, None, 1, 0),
+    "kt_tile_k2_bf16_n1280": (torch.bfloat16, 1, None, 1, 0),
+    "kt_tile_k2_bf16_n3456": (torch.bfloat16, 1, None, 1, 0),
+
     "kt_amx_bf16": (torch.bfloat16, 1, None, 1, 0),
     "kt_tile_k2_bf16": (torch.bfloat16, 1, None, 1, 0),
     "kt_tile_k2_bf16_nopf": (torch.bfloat16, 1, None, 1, 0),
@@ -80,8 +93,10 @@ _WEIGHT_FORMAT = {
     "kt_tile_k2_mxfp4": (torch.uint8, 2, torch.bfloat16, 32, 32),
     "kt_tile_k2_fp8b128": (torch.uint8, 1, torch.float32, 128 * 128, 128),
     "kt_tile_k1_fp8b128": (torch.uint8, 1, torch.float32, 128 * 128, 128),
+    "kt_tile_k1_bf16": (torch.bfloat16, 1, None, 1, 0),
     # scale_div None = "expert당 배율 1개" (weight 원소 수와 무관하게 [E]). group_size 0 = per-tensor.
     "kt_tile_k2_fp8pt": (torch.uint8, 1, torch.float32, None, 0),
+    "kt_tile_k1_fp8pt": (torch.uint8, 1, torch.float32, None, 0),
 }
 FP4_GROUP_SIZE = 32
 
@@ -206,19 +221,41 @@ class PartialMoEWrapper:
         ("down_pair_dot", "down", 2),
     )
     _SPARSITY_KEYS = _SCORE_KEYS + _THR_KEYS  # 페어 마스크 커널의 전체 집합 (하위 호환 이름)
+    # per-k 커널이 **선택적으로** 받는 열 노름 (score k1w1: |x_k|·wn_k >= thr).
+    # 주면 C++가 x²·a >= thr²로 판정하고, 안 주면 순수 |x| >= thr(score k1)이다 —
+    # 마스크 종류를 커널이 아니라 **테이블이** 정한다 (moe_base `build_mask`).
+    _WN_KEYS = (("gate_wn_sq", "gate", 1), ("up_wn_sq", "up", 1), ("down_wn_sq", "down", 1))
 
     @property
     def mask_per_k(self) -> bool:
         """이 커널의 Seam B 마스크가 per-k(score k1)인가. C++ 클래스가 소유한 사실을 그대로 읽는다."""
         return bool(getattr(self._moe_class, "mask_per_k", False))
 
-    def sparsity_keys(self):
-        """이 커널이 요구하는 sparsity 테이블 키 표 (키, 축, 나눔)."""
-        return self._THR_KEYS if self.mask_per_k else self._SPARSITY_KEYS
+    def sparsity_keys(self, tables=None):
+        """이 커널이 **요구하는** sparsity 테이블 키 표 (키, 축, 나눔).
+
+        per-k 커널은 thr 셋이 필수이고 `*_wn_sq` 셋은 선택이다 (score k1w1). `tables`를
+        주면 그중 실제로 온 것까지 포함해 돌려준다 — 검증이 "온 것은 전부 맞는 모양인가"를
+        보게 하려는 것이다. wn을 셋 중 일부만 주는 것은 거절한다 (proj마다 점수가 갈리면
+        어느 자산으로 잰 건지 알 수 없다).
+        """
+        if not self.mask_per_k:
+            return self._SPARSITY_KEYS
+        if tables is None:
+            return self._THR_KEYS
+        present = [n for n, _, _ in self._WN_KEYS if n in tables]
+        if not present:
+            return self._THR_KEYS
+        if len(present) != len(self._WN_KEYS):
+            raise ValueError(
+                f"per-k 커널의 wn 테이블은 셋 다 주거나 하나도 주지 말아야 한다 "
+                f"(score k1w1 vs k1). 받은 것: {present}"
+            )
+        return self._THR_KEYS + self._WN_KEYS
 
     def _install_sparsity(self, cfg, tables: dict) -> None:
         """테이블 검증 + config 포인터 설치. 참조는 self가 영구 보관한다."""
-        keys = self.sparsity_keys()
+        keys = self.sparsity_keys(tables)
         missing = [n for n, _, _ in keys if n not in tables]
         if missing:
             raise ValueError(f"sparsity_tables missing keys: {missing}")

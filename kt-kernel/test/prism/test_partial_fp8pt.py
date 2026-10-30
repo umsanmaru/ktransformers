@@ -102,9 +102,11 @@ class Weights:
         sc = getattr(self, name + "_scale").double().view(E, 1, 1)
         return fp8_dequant(codes) * sc
 
-    def load(self, cpuinfer, tables=None, p=0.5):
+    def load(self, cpuinfer, tables=None, p=0.5, kernel_key=KERNEL):
+        """`kernel_key`는 per-k 형제(`kt_tile_k1_fp8pt`)가 같은 픽스처를 재사용하려고 열어 둔
+        인자다 — 두 커널은 입력(코드 + 배율 [E])과 기하 제약이 같고 마스크만 다르다."""
         cfg = make_config(cpuinfer, tables, p)
-        w = PartialMoEWrapper(cfg, cpuinfer, kernel_key=KERNEL)
+        w = PartialMoEWrapper(cfg, cpuinfer, kernel_key=kernel_key)
         w.load_weights_from_tensors(
             self.gate, self.up, self.down, sparsity_tables=tables,
             gate_scale=self.gate_scale, up_scale=self.up_scale, down_scale=self.down_scale,

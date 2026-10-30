@@ -12,8 +12,8 @@
  *   1 < m (소배치)    — 토큰 루프 (dense plan per token). prefill(m ≫ 1)은 sglang이 GPU(KT_TILE8
  *                       로더)로 보낸다 — 이 operator의 `mat_mat`은 존재하지 않는다.
  *
- * 템플릿 인자 T로 `GemmKernelTileK1FP8B128`(k=1 타일, per-k 마스크 — la/tile_k1_fp8b128.hpp)도 그대로
- * 인스턴스화된다. 두 커널은 BufferB 크기·배율 pack·slab 기하가 같고 그룹 안 바이트 순열과 마스크
+ * 템플릿 인자 T로 `GemmKernelTileK1FP8B128`(k=1 타일, per-k 마스크 — la/tile_k1_fp8b128.hpp)과
+ * `GemmKernelTileK1FP8PT`(그 per-tensor 판)도 그대로 인스턴스화된다. 두 커널은 BufferB 크기·배율 pack·slab 기하가 같고 그룹 안 바이트 순열과 마스크
  * 종류만 다르다 — 마스크 분기는 moe_base(`kMaskPerK`)가 한다.
  *
  * 이 operator는 **Prism partial 전용**이다: 타일 레이아웃은 GPU가 제자리 읽는 cold slab의
@@ -25,6 +25,7 @@
 #include "fp8-moe.hpp"
 #include "la/tile_k1_fp8b128.hpp"
 #include "la/tile_k2_fp8b128.hpp"
+#include "la/tile_k1_fp8pt.hpp"
 #include "la/tile_k2_fp8pt.hpp"
 
 /// 커널이 per-tensor 배율(`kPerTensorScale`, SCALE_BLK == 0)을 쓰는가. 없으면 128×128 블록.

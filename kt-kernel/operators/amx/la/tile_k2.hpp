@@ -14,7 +14,8 @@
  *
  * ## no-SW-pf 형제
  *
- * 커널은 `SwPf` 하나로 템플릿화돼 있고 두 인스턴스가 나온다:
+ * 커널은 `SwPf`와 물리 N 블록 폭 `BlockN`으로 템플릿화돼 있다. 기본 폭은 256이며
+ * 기본 폭의 두 인스턴스가 나온다:
  * `GemmKernelTileK2BF16`(프리페치 있음, plan 키 `kt_tile_k2_bf16`)과
  * `GemmKernelTileK2BF16NoPF`(없음, `kt_tile_k2_bf16_nopf`). 후자는 "SW 프리페처 없음"
  * ablation 전용이고, 소비 커서와 prefill B-panel 프리페치(base `amx_kernel_pf<false>`),
@@ -29,7 +30,7 @@
  * 소비될지"를 알 수 없기 때문이다. 그래서 이 커널은 `float_mat_vec`의 루프를
  * 대신 소유한다 (Seam A의 opt-in 분기).
  *
- * ## 레이아웃 대응 (해석적으로 확인, 2026-08-26)
+ * ## 기본 BlockN=256의 레이아웃 대응 (해석적으로 확인, 2026-08-26)
  *
  * NC의 `pack_block`을 전개하면 (n_block, k_block) 영역 안에서
  *
@@ -46,6 +47,10 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cerrno>
+#include <climits>
+#include <stdexcept>
 #include <string>
 
 #include "act_plan.hpp"
@@ -58,12 +63,15 @@ namespace amx {
 /// `if constexpr`로 사라진다 — 실행 시 분기 하나도 남지 않는다. weight 레이아웃·
 /// plan 인코딩·누산 순서는 두 인스턴스가 **비트 단위로 같다** (BufferB 타입도
 /// 상속받은 하나를 공유하므로 slab·pack·GPU 로더도 그대로다).
-template <bool SwPf>
-struct GemmKernelTileK2BF16Impl : GemmKernel224BF16RowMajorNC {
-  using Base = GemmKernel224BF16RowMajorNC;
-  using BufferA = Base::BufferA;
-  using BufferB = Base::BufferB;
-  using BufferC = Base::BufferC;
+template <bool SwPf, int BlockN = 256>
+struct GemmKernelTileK2BF16Impl : GemmKernel224BF16RowMajorNCImpl<BlockN> {
+  using Base = GemmKernel224BF16RowMajorNCImpl<BlockN>;
+  using Base::N_BLOCK;
+  using Base::N_STEP;
+  using Base::K_STEP;
+  using BufferA = typename Base::BufferA;
+  using BufferB = typename Base::BufferB;
+  using BufferC = typename Base::BufferC;
 
   /// moe_base가 prep/export 보조 프리페치를 맞춰 끄는 근거 (없는 커널은 켜짐 취급).
   static constexpr bool kSwPrefetch = SwPf;
@@ -73,11 +81,29 @@ struct GemmKernelTileK2BF16Impl : GemmKernel224BF16RowMajorNC {
   /// 프리페치 거리 (소비 스트림의 64 B 라인 수). 측정 우승자, T1 힌트.
   static constexpr int PF_DIST = 128;
 
-  /// 한 타일 컬럼 = N_BLOCK(256) n × K_STEP(32) k.
-  static constexpr int TILE_ELEMS = 8192;
-  /// n-그룹: 16 n씩 16개. 각 그룹의 chunk가 정확히 64 B 라인 하나다.
+  // Read once per process. The unit is a 64-byte line in consumption order,
+  // not a byte offset in the original weight matrix. Zero disables only the
+  // decode weight-stream prefetch; the NoPF kernel also disables other hints.
+  static int prefetch_distance() {
+    if constexpr (!SwPf) return 0;
+    static const int value = []() {
+      const char* text = std::getenv("KT_K2_BF16_PF_DIST");
+      if (text == nullptr) return PF_DIST;
+      char* end = nullptr;
+      errno = 0;
+      const long parsed = std::strtol(text, &end, 10);
+      if (errno != 0 || end == text || *end != '\0' || parsed < 0 || parsed > INT_MAX)
+        throw std::invalid_argument("KT_K2_BF16_PF_DIST must be an integer in [0, INT_MAX]");
+      return static_cast<int>(parsed);
+    }();
+    return value;
+  }
+
+  /// 한 타일 컬럼 = N_BLOCK n × K_STEP(32) k.
+  static constexpr int TILE_ELEMS = N_BLOCK * K_STEP;
+  /// n-그룹: 16 n씩 N_BLOCK/16개. 그룹별 페어 chunk는 64 B 라인 하나다.
   static constexpr int GROUP_N = 16;
-  static constexpr int NGROUP = 16;
+  static constexpr int NGROUP = N_BLOCK / GROUP_N;
   static constexpr int GROUP_STRIDE = 512;
 
   // ── 인코더 (Seam B) ──────────────────────────────────────────────────
@@ -180,12 +206,12 @@ struct GemmKernelTileK2BF16Impl : GemmKernel224BF16RowMajorNC {
     return t;
   }
 
-  /// 256 n 슈퍼블록 하나. y는 L1에 두고 (컬럼, 그룹) 방문마다 load/store 한 쌍
+  /// N_BLOCK n 슈퍼블록 하나. y는 L1에 두고 (컬럼, 그룹) 방문마다 load/store 한 쌍
   /// (ymem 정책) — 누산기 16개가 레지스터에 상주하는 reg 정책의 A/B 상대이고,
   /// 이 변종이 측정 우승자다.
   static void super_block(const ggml_bf16_t* W, float* ys, const uint32_t* koff, const uint32_t* pval,
-                          const uint32_t* seg, int ncols, int npairs) {
-    [[maybe_unused]] Cursor cu = cursor_start(seg, ncols, SwPf ? npairs : 0, PF_DIST);
+                          const uint32_t* seg, int ncols, int npairs, int pf_dist = PF_DIST) {
+    [[maybe_unused]] Cursor cu = cursor_start(seg, ncols, SwPf && pf_dist > 0 ? npairs : 0, pf_dist);
     for (int c = 0; c < ncols; c++) {
       const int jlo = (int)seg[c], jhi = (int)seg[c + 1];
       if (jlo == jhi) continue;
@@ -214,8 +240,8 @@ struct GemmKernelTileK2BF16Impl : GemmKernel224BF16RowMajorNC {
   /// **마지막 블록 하나**뿐이므로 주 경로의 코드젠은 손대지 않는다.
   static void super_block_partial(const ggml_bf16_t* W, float* ys, const uint32_t* koff,
                                   const uint32_t* pval, const uint32_t* seg, int ncols, int npairs,
-                                  int ngroup) {
-    [[maybe_unused]] Cursor cu = cursor_start(seg, ncols, SwPf ? npairs : 0, PF_DIST, ngroup);
+                                  int ngroup, int pf_dist = PF_DIST) {
+    [[maybe_unused]] Cursor cu = cursor_start(seg, ncols, SwPf && pf_dist > 0 ? npairs : 0, pf_dist, ngroup);
     for (int c = 0; c < ncols; c++) {
       const int jlo = (int)seg[c], jhi = (int)seg[c + 1];
       if (jlo == jhi) continue;
@@ -250,17 +276,18 @@ struct GemmKernelTileK2BF16Impl : GemmKernel224BF16RowMajorNC {
     // 여전히 1차 방어선이다).
     assert(n % N_BLOCK == 0 || plan->koff_tail != nullptr);
     float* c_row = bc->c;
+    const int pf_dist = prefetch_distance();
     // ymem 정책은 누산기를 메모리에서 읽어 더한다 — 시작 전에 0으로 둔다.
     for (int j = n0; j < n1; j++) c_row[j] = 0.0f;
     for (int nb = n0; nb < n1; nb += N_BLOCK) {
       const ggml_bf16_t* W = bb->b + (size_t)nb * k;
       const int w = std::min(N_BLOCK, n - nb);
       if (w == N_BLOCK) {
-        super_block(W, c_row + nb, plan->koff, plan->pval, plan->seg, plan->nseg, plan->npairs);
+        super_block(W, c_row + nb, plan->koff, plan->pval, plan->seg, plan->nseg, plan->npairs, pf_dist);
       } else {
         assert(plan->koff_tail != nullptr && plan->ngroup_tail == w / GROUP_N);
         super_block_partial(W, c_row + nb, plan->koff_tail, plan->pval, plan->seg, plan->nseg,
-                            plan->npairs, plan->ngroup_tail);
+                            plan->npairs, plan->ngroup_tail, pf_dist);
       }
     }
   }
@@ -272,7 +299,7 @@ struct GemmKernelTileK2BF16Impl : GemmKernel224BF16RowMajorNC {
   /// 부르는 이유 — 두 인스턴스는 BufferB 타입을 공유하므로 오버로드로는 갈릴 수 없다).
   static void amx_kernel(int m, int n, int k, int m_begin, int n_begin, int k_block_begin, float* c, BufferA* ba,
                          BufferB* bb) {
-    Base::amx_kernel_pf<SwPf>(m, n, k, m_begin, n_begin, k_block_begin, c, ba, bb);
+    Base::template amx_kernel_pf<SwPf>(m, n, k, m_begin, n_begin, k_block_begin, c, ba, bb);
   }
 };
 

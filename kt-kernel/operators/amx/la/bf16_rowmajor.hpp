@@ -250,7 +250,9 @@ struct BufferBBF16NContigImpl {
  * than by one tile-pair, so the prefetch strides by that run instead of running
  * contiguously. Everything else is the same recipe GemmKernel224BF16 uses.
  */
-struct GemmKernel224BF16RowMajorNC {
+template <int BlockN = 256>
+struct GemmKernel224BF16RowMajorNCImpl {
+  static_assert(BlockN > 0 && BlockN % 32 == 0);
   using dt = ggml_bf16_t;
   using output_t = float;
   static constexpr double ELEMENT_SIZE = 2;
@@ -263,7 +265,7 @@ struct GemmKernel224BF16RowMajorNC {
   static constexpr int N_STEP = TILE_N * 2;
   static constexpr int K_STEP = TILE_K;
 
-  static inline const int N_BLOCK = 256;
+  static inline const int N_BLOCK = BlockN;
   static inline const int K_BLOCK = 1792;
 
   static constexpr int A_ROW_PAD = 32;  // bf16 elements
@@ -288,9 +290,9 @@ struct GemmKernel224BF16RowMajorNC {
 
   static void config() { GemmKernel224BF16::config(); }
 
-  using BufferA = BufferARowMajorBF16Impl<GemmKernel224BF16RowMajorNC>;
-  using BufferB = BufferBBF16NContigImpl<GemmKernel224BF16RowMajorNC>;
-  using BufferC = BufferCRowMajorFP32Impl<GemmKernel224BF16RowMajorNC>;
+  using BufferA = BufferARowMajorBF16Impl<GemmKernel224BF16RowMajorNCImpl>;
+  using BufferB = BufferBBF16NContigImpl<GemmKernel224BF16RowMajorNCImpl>;
+  using BufferC = BufferCRowMajorFP32Impl<GemmKernel224BF16RowMajorNCImpl>;
 
   /// `SwPf == false`이면 B 패널 프리페치를 **코드에서** 뺀다 (no-SW-pf 형제 커널용,
   /// tile_k2.hpp `GemmKernelTileK2BF16NoPF`). 기본 진입점 `amx_kernel`은 `SwPf = true`다.
@@ -392,6 +394,8 @@ struct GemmKernel224BF16RowMajorNC {
     }
   }
 };
+
+using GemmKernel224BF16RowMajorNC = GemmKernel224BF16RowMajorNCImpl<256>;
 
 inline void mat_mul(int m, int n, int k, std::shared_ptr<GemmKernel224BF16RowMajorNC::BufferA> ba,
                     std::shared_ptr<GemmKernel224BF16RowMajorNC::BufferB> bb,

@@ -648,16 +648,23 @@ class AMX_MOE_BASE {
     amx::build_pair_mask(src, k_rows, k_real, a_sq, c, thr, out);
   }
 
-  // ── per-k 마스크 (score `k1`, 2026-09-05) ───────────────────────────────
-  // keep_k = |x_k| >= thr. 가중치 통계(a_sq/c)를 쓰지 않는다 — 구현은 k_mask.hpp.
-  // 마스크 종류를 하나로 부르는 창구: 커널이 요구하는 쪽을 컴파일 타임에 고른다.
+  // ── per-k 마스크 (score `k1` 2026-09-05 / `k1w1` 2026-09-07) ─────────────
+  //   k1    keep_k = |x_k| >= thr                 (가중치 통계 없음)
+  //   k1w1  keep_k = |x_k|·wn_k >= thr  ⇔  x²·a >= thr²   (a = wn²)
+  // **어느 쪽인지는 커널이 아니라 주입된 테이블이 정한다**: per-k 커널에 `a_sq`가
+  // 오면 k1w1, 안 오면 k1이다. 커널은 둘 다 "k 한 행 skip"으로 같게 소비하므로
+  // 컴파일 타임에 가를 이유가 없고, 자산(자산의 thr 곡선이 어느 점수의 분위수인가)이
+  // 정하는 사실을 런타임 포인터로 옮긴 것이다.
   // 페어 경로의 인자·순서는 그대로다 (계약 ①의 k2wl2 수치는 손대지 않는다).
   static void build_mask(const ggml_bf16_t* src, int k_rows, int k_real, const float* a_sq, const float* c,
                          float thr, MaskWord* out) {
     if constexpr (kMaskPerK) {
-      (void)a_sq;
       (void)c;
-      amx::build_k_mask(src, k_rows, k_real, thr, out);
+      if (a_sq != nullptr) {
+        amx::build_k_mask_w(src, k_rows, k_real, a_sq, thr * thr, out);
+      } else {
+        amx::build_k_mask(src, k_rows, k_real, thr, out);
+      }
     } else {
       amx::build_pair_mask(src, k_rows, k_real, a_sq, c, thr, out);
     }
@@ -737,9 +744,10 @@ class AMX_MOE_BASE {
     const bool sparse = sp.enabled && weights != nullptr;
     // per-k 커널은 가중치 통계를 쓰지 않는다 — 포인터를 비워 아래 오프셋 산술·prefetch가
     // 전부 건너뛰게 한다 (테이블이 주입되지 않았을 수도 있다).
-    const float* g_a = kMaskPerK ? nullptr : (const float*)sp.gate_wn_sq;
+    // per-k도 wn_sq는 받는다 (score k1w1). 없으면 nullptr이고 그때가 k1이다.
+    const float* g_a = (const float*)sp.gate_wn_sq;
     const float* g_c = kMaskPerK ? nullptr : (const float*)sp.gate_pair_dot;
-    const float* u_a = kMaskPerK ? nullptr : (const float*)sp.up_wn_sq;
+    const float* u_a = (const float*)sp.up_wn_sq;
     const float* u_c = kMaskPerK ? nullptr : (const float*)sp.up_pair_dot;
     const float* g_t = (const float*)sp.thr_gate;
     const float* u_t = (const float*)sp.thr_up;
@@ -829,7 +837,7 @@ class AMX_MOE_BASE {
     const int qlen = 1;
     const auto& sp = config_.partial.sparsity;
     const bool sparse = sp.enabled && weights != nullptr;
-    const float* d_a = kMaskPerK ? nullptr : (const float*)sp.down_wn_sq;
+    const float* d_a = (const float*)sp.down_wn_sq;
     const float* d_c = kMaskPerK ? nullptr : (const float*)sp.down_pair_dot;
     const float* d_t = (const float*)sp.thr_down;
     const int act_row = config_.n_total();  // act의 slot 행 stride = down K 축 길이
