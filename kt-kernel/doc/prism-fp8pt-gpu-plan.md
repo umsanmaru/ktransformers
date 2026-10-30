@@ -89,6 +89,25 @@ pt≡b128 균일배율 비트일치, 비-2^n 배율, kt_tile8pt slab 로더), �
 디코드(`e4m3_val`)는 그대로. 주석의 "128×128 블록" 문구를 "블록 또는 per-tensor" 로 고치고
 `kBlk`는 블록판 전용임을 적는다.
 
+## 1.5 MoE 레인 포맷 등록 — **완료 (2026-09-06, worktree `sglang-fp8pt-moe`, branch `fp8pt-moe-format`, ce6518324e 분기, 미커밋)**
+
+지적받은 두 공백을 메웠다: (1) `fp8pt`가 `moe/prism/formats.FORMATS`에 없어 프로파일러 전용 어댑터(`Fp8PtGpu`)로만
+돌았고 plan으로 MoE 레인을 띄울 수 없었다, (2) 그 어댑터에 grouped/grouped_gateup/grouped_cold가 없어 prefill과
+cold slab GPU 읽기를 못 잤다.
+
+- `formats.py`: `Fp8PtFormat(Fp8Format)` — `w13_weight_scale [E, 2]`(gate, up)·`w2_weight_scale [E]`(sglang per-tensor
+  `Fp8MoEMethod` 이름·모양, `quant_method = tensor`), `w13/w2_input_scale [E]`는 등록만(미사용). `proj_source`가 proj당
+  `[E]` 스칼라를 고르고, `gather`/`cold_flat`은 코드만 자르고 배율 `[E]`를 그대로 넘긴다. `check_index`는 "expert별 행
+  **수** % 32"만(위치 임의 — 배율 블록 제약 없음). GPU 진입점 `gemv_fp8pt_*`/`grouped_fp8pt_*`, cold slab은
+  `grouped_fp8_cold`(layout `kt_tile8pt` = KT_TILE8_PT). `FORMATS["fp8pt"]` 등록.
+- `prism/kernels.py`: `gemv_worklist_fp8pt` → `"fp8pt"`. `cold_gpu.py`: `kt_tile8pt` n_block 256 검사.
+- 프로파일러 `Store("fp8pt")`가 레지스트리 포맷을 쓰도록 `Fp8PtGpu` 제거.
+- 테스트 `test/prism/test_fp8pt_format.py` 13개(레지스트리·파라미터·proj 배율 선택·정렬·재조립 비트일치·잘못된 cold
+  커널 거절), `test_kernels.py` 갱신; `test_profile_dtype.py` 22·`test_weights.py` 24·GPU 커널 64 회귀 통과.
+- 관찰: K가 32 배수이고 티어가 [0, K)를 나누므로 fp8pt에서는 cold 타일 패딩이 실제로 발생하지 않는다(한 티어가
+  비정렬이면 다른 티어도 비정렬 → check_index가 먼저 거절).
+- MoE per-tensor fp8 체크포인트(Mistral Large 3?)의 배율 포맷은 **미확인** — HF config.json이 404였다.
+
 ## 2. sglang dense 레인
 
 ### 2.1 `srt/layers/prism/kernels.py`
