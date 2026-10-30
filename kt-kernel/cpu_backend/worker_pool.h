@@ -17,6 +17,8 @@
 #include <barrier>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -25,7 +27,19 @@
 
 // #define PROFILE_BALANCE
 
+// Opt-in fallback for memory-capacity experiments. CPU affinity stays local,
+// but MPOL_PREFERRED lets allocations use another node when this one is full.
+inline bool kt_preferred_numa_memory() {
+  const char* policy = std::getenv("KT_NUMA_MEMORY_POLICY");
+  return policy != nullptr && std::strcmp(policy, "preferred") == 0;
+}
+
 inline void set_to_numa(int this_numa) {
+  if (kt_preferred_numa_memory()) {
+    if (numa_run_on_node(this_numa) != 0) perror("numa_run_on_node");
+    numa_set_preferred(this_numa);
+    return;
+  }
   struct bitmask* mask = numa_bitmask_alloc(numa_num_configured_nodes());
   numa_bitmask_setbit(mask, this_numa);
   numa_bind(mask);
@@ -33,6 +47,11 @@ inline void set_to_numa(int this_numa) {
 }
 
 inline void set_memory_to_numa(int this_numa) {
+  if (kt_preferred_numa_memory()) {
+    numa_set_preferred(this_numa);
+    fprintf(stderr, "[kt] NUMA memory policy=preferred node=%d (remote fallback enabled)\n", this_numa);
+    return;
+  }
   // printf("Set memory to NUMA %d\n", this_numa);
   hwloc_topology_t topology;
   hwloc_topology_init(&topology);
