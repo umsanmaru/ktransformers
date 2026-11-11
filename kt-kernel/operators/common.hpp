@@ -360,6 +360,9 @@ struct PartialGeometry {
     float grid = 0.0f;
     int ng = 0;
     int renorm_it = 0;
+    // Threshold-controller mask counters: int64 [3][2] = {gate, up, down} x {kept, total},
+    // cumulative and host-pinned (a GPU kernel reads them). Only tp part 0 writes; nullptr = off.
+    void* keep_ctr = nullptr;
   };
   SparsityGeometry sparsity;
 };

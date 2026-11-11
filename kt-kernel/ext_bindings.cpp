@@ -886,6 +886,7 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .DEF_PTR_PROPERTY(PartialGeometry::SparsityGeometry, thr_gate)
       .DEF_PTR_PROPERTY(PartialGeometry::SparsityGeometry, thr_up)
       .DEF_PTR_PROPERTY(PartialGeometry::SparsityGeometry, thr_down)
+      .DEF_PTR_PROPERTY(PartialGeometry::SparsityGeometry, keep_ctr)
       .def_readwrite("p_gate", &PartialGeometry::SparsityGeometry::p_gate)
       .def_readwrite("lam_gate", &PartialGeometry::SparsityGeometry::lam_gate)
       .def_readwrite("p_up", &PartialGeometry::SparsityGeometry::p_up)

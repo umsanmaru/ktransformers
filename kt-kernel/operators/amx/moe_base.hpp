@@ -656,6 +656,34 @@ class AMX_MOE_BASE {
   // 컴파일 타임에 가를 이유가 없고, 자산(자산의 thr 곡선이 어느 점수의 분위수인가)이
   // 정하는 사실을 런타임 포인터로 옮긴 것이다.
   // 페어 경로의 인자·순서는 그대로다 (계약 ①의 k2wl2 수치는 손대지 않는다).
+  // Kept and total mask units of one built mask: pairs, or k rows for per-k masks.
+  // Every mask word covers 32 k rows, and bits past k_real are already cleared by the builder.
+  static void mask_counts(const MaskWord* mask, int k_rows, int k_real, uint32_t* kept, uint32_t* total) {
+    uint32_t n = 0;
+    for (int t = 0; t < k_rows / 32; t++) {
+      n += (uint32_t)__builtin_popcount((uint32_t)mask[t]);
+    }
+    *kept = n;
+    *total = (uint32_t)(kMaskPerK ? k_real : k_real / 2);
+  }
+
+  // Adds one step's per-slot counts to SparsityGeometry::keep_ctr[proj]. Every tp part builds
+  // the same mask (the parts split N, not K), so only part 0 counts.
+  void add_keep_counts(int proj, int k, const uint32_t* kept, const uint32_t* total) {
+    int64_t kept_sum = 0, total_sum = 0;
+    for (int j = 0; j < k; j++) {
+      kept_sum += kept[j];
+      total_sum += total[j];
+    }
+    auto* ctr = static_cast<int64_t*>(config_.partial.sparsity.keep_ctr);
+    ctr[2 * proj] += kept_sum;
+    ctr[2 * proj + 1] += total_sum;
+  }
+
+  bool counting_keep(bool sparse) const {
+    return sparse && config_.partial.sparsity.keep_ctr != nullptr && tp_part_idx == 0;
+  }
+
   static void build_mask(const ggml_bf16_t* src, int k_rows, int k_real, const float* a_sq, const float* c,
                          float thr, MaskWord* out) {
     if constexpr (kMaskPerK) {
@@ -757,6 +785,9 @@ class AMX_MOE_BASE {
       slot_sparsity(weights, k, sp.p_gate, sp.lam_gate, sp.pmax, sp.renorm_it, s_gate);
       slot_sparsity(weights, k, sp.p_up, sp.lam_up, sp.pmax, sp.renorm_it, s_up);
     }
+    // Per-slot counts; each task writes only its own slot, so no synchronization is needed.
+    const bool counting = counting_keep(sparse);
+    uint32_t kept_g[kMaxTopK] = {}, tot_g[kMaxTopK] = {}, kept_u[kMaxTopK] = {}, tot_u[kMaxTopK] = {};
 
     // dual_pack이면 gate와 up이 각자 gather/pack하므로 태스크를 둘로 나눈다
     // (병렬도 A → 2A). 아니면 up 마스크가 gate의 gather 결과를 읽으므로 한
@@ -790,6 +821,9 @@ class AMX_MOE_BASE {
             }
             build_mask(xu, config_.up_k(e), config_.up_k_real(e), ua, uc,
                             thr_of(u_t, e, sp.ng, sp.grid, s_up[j]), m_pair_mask_up_[e].data());
+            if (counting) {
+              mask_counts(m_pair_mask_up_[e].data(), config_.up_k(e), config_.up_k_real(e), &kept_u[j], &tot_u[j]);
+            }
             if constexpr (kHasPlanEncoder) {
               amx::build_plan_for<T>(m_pair_mask_up_[e].data(), xu, config_.up_k(e),
                                      plan_arena_for((int)e, 1), &m_plan_up_[e],
@@ -812,6 +846,10 @@ class AMX_MOE_BASE {
           }
           build_mask(xg, config_.gate_k(e), config_.gate_k_real(e), ga, gc,
                           thr_of(g_t, e, sp.ng, sp.grid, s_gate[j]), m_pair_mask_gate_[e].data());
+          if (counting) {
+            mask_counts(m_pair_mask_gate_[e].data(), config_.gate_k(e), config_.gate_k_real(e), &kept_g[j],
+                        &tot_g[j]);
+          }
           if constexpr (kHasPlanEncoder) {
             // 마스크(정책, 절대 k)를 커널의 자료구조로 인코딩한다 — expert당
             // 1회, 결과는 read-only로 전 워커가 공유한다.
@@ -822,6 +860,10 @@ class AMX_MOE_BASE {
           if (!dual) {
             build_mask(xg, config_.up_k(e), config_.up_k_real(e), ua, uc,
                             thr_of(u_t, e, sp.ng, sp.grid, s_up[j]), m_pair_mask_up_[e].data());
+            if (counting) {
+              mask_counts(m_pair_mask_up_[e].data(), config_.up_k(e), config_.up_k_real(e), &kept_u[j],
+                          &tot_u[j]);
+            }
             if constexpr (kHasPlanEncoder) {
               amx::build_plan_for<T>(m_pair_mask_up_[e].data(), xg, config_.up_k(e),
                                      plan_arena_for((int)e, 1), &m_plan_up_[e],
@@ -830,6 +872,10 @@ class AMX_MOE_BASE {
           }
         },
         nullptr);
+    if (counting) {
+      add_keep_counts(0, k, kept_g, tot_g);
+      add_keep_counts(1, k, kept_u, tot_u);
+    }
     m_sparse_active_ = sparse;
   }
 
@@ -846,6 +892,8 @@ class AMX_MOE_BASE {
     if (sparse) {
       slot_sparsity(weights, k, sp.p_down, sp.lam_down, sp.pmax, sp.renorm_it, s_down);
     }
+    const bool counting = counting_keep(sparse);
+    uint32_t kept_d[kMaxTopK] = {}, tot_d[kMaxTopK] = {};
 
     auto pool = config_.pool->get_subpool(tp_part_idx);
     pool->do_work_stealing_job(
@@ -867,12 +915,19 @@ class AMX_MOE_BASE {
           }
           build_mask(src, config_.down_k(e), config_.down_k_real(e), da, dc,
                           thr_of(d_t, e, sp.ng, sp.grid, s_down[j]), m_pair_mask_down_[e].data());
+          if (counting) {
+            mask_counts(m_pair_mask_down_[e].data(), config_.down_k(e), config_.down_k_real(e), &kept_d[j],
+                        &tot_d[j]);
+          }
           if constexpr (kHasPlanEncoder) {
             amx::build_plan_for<T>(m_pair_mask_down_[e].data(), src, config_.down_k(e),
                                    plan_arena_for((int)e, 2), &m_plan_down_[e], config_.down_n());
           }
         },
         nullptr);
+    if (counting) {
+      add_keep_counts(2, k, kept_d, tot_d);
+    }
     m_sparse_active_ = sparse;
   }
 

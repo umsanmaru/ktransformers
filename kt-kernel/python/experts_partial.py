@@ -119,6 +119,7 @@ class PartialMoEWrapper:
         self._moe_class = _PARTIAL_MOE_CLASSES[kernel_key]()
         self._moe = None
         self._sparsity_tables = None  # 설치되면 wrapper 수명 내내 보관
+        self._keep_counter = None
 
     # ── Stage 2: 로딩 (kt SFT 텐서 주입 경로와 동형) ─────────────────────
     def load_weights_from_tensors(
@@ -131,6 +132,7 @@ class PartialMoEWrapper:
         gate_scale: Optional[torch.Tensor] = None,  # kt_amx_fp4: bf16 [E·inter·gateup_k/32] (2^e)
         up_scale: Optional[torch.Tensor] = None,
         down_scale: Optional[torch.Tensor] = None,
+        keep_counter: Optional[torch.Tensor] = None,
     ) -> None:
         """sparsity_tables: 주면 sparse decode가 켜진다 (없으면 dense).
 
@@ -200,6 +202,8 @@ class PartialMoEWrapper:
 
         if sparsity_tables is not None:
             self._install_sparsity(cfg, sparsity_tables)
+        if keep_counter is not None:
+            self._install_keep_counter(cfg, keep_counter)
 
         self._moe = self._moe_class(cfg)  # config가 C++로 복사되는 순간
         self._cpuinfer.submit(self._moe.load_weights_task(phys_map.data_ptr()))
@@ -288,6 +292,21 @@ class PartialMoEWrapper:
         for name in kept:
             setattr(sp, name, kept[name].data_ptr())
         sp.enabled = True
+
+    def _install_keep_counter(self, cfg, counter: torch.Tensor) -> None:
+        """Mask counters for a threshold controller: int64 [3, 2] = {gate, up, down} x {kept, total}.
+
+        C++ adds to them on every sparse decode step, so the wrapper holds the reference.
+        """
+        if not cfg.partial.sparsity.enabled:
+            raise ValueError("keep_counter requires sparsity_tables")
+        if (counter.dtype != torch.int64 or tuple(counter.shape) != (3, 2)
+                or not counter.is_contiguous() or counter.device.type != "cpu"):
+            raise ValueError(
+                f"keep_counter must be a contiguous CPU int64 [3, 2] tensor, got "
+                f"{counter.dtype} {tuple(counter.shape)} device={counter.device}")
+        self._keep_counter = counter
+        cfg.partial.sparsity.keep_ctr = counter.data_ptr()
 
     def _require_loaded(self):
         if self._moe is None:

@@ -426,7 +426,7 @@ def ramp_thr_tables(tables, cutoff_idx, ng=SP_NG):
 
 
 def build_sparse_moe(gate_cold, up_cold, down_cold, cpuinfer, tables,
-                     p=0.5, lam=0.0):
+                     p=0.5, lam=0.0, keep_ctr=None):
     """build_partial_moe와 같지만 sparsity 예산 + 테이블을 설치한다.
 
     테이블은 C++가 step마다 원시 포인터로 읽으므로 호출자가 붙잡고 있어야
@@ -459,6 +459,8 @@ def build_sparse_moe(gate_cold, up_cold, down_cold, cpuinfer, tables,
     for name, t in tables.items():
         setattr(sp, name, t.data_ptr())
     sp.enabled = True
+    if keep_ctr is not None:
+        sp.keep_ctr = keep_ctr.data_ptr()
 
     moe = kt_kernel_ext.moe.AMXBF16_MOE(config)
     phys_map = torch.arange(expert_num, dtype=torch.int64).contiguous()
@@ -621,6 +623,69 @@ def test_sparse_down_matches_masked_dense():
 
     total = num_experts_per_tok * (DOWN_K_ROWS // 2)
     assert 0 < kept_total < total, f"마스크가 무의미 ({kept_total}/{total})"
+
+
+def _keep_counter_case(seed):
+    """Weights, routing, inputs and mid thresholds whose expected masks are known in Python."""
+    torch.manual_seed(seed)
+    gate_cold, up_cold, down_cold = make_weights(randn_gen)
+    base = sparsity_tables_from_weights(gate_cold, up_cold, down_cold)
+    ids = make_routing(1)
+    x = randn_gen((1, hidden_size)).contiguous()
+    act = randn_gen((1, num_experts_per_tok, intermediate_size)).contiguous()
+    experts = [int(ids[0, j]) for j in range(num_experts_per_tok)]
+    band = x[0, GATEUP_K_OFFSET : GATEUP_K_OFFSET + GATEUP_K_ROWS]
+    energies = (
+        [pair_energy(band, base["gate_wn_sq"][e], base["gate_pair_dot"][e]) for e in experts],
+        [pair_energy(band, base["up_wn_sq"][e], base["up_pair_dot"][e]) for e in experts],
+        [pair_energy(act[0, j, DOWN_K_OFFSET : DOWN_K_OFFSET + DOWN_K_ROWS],
+                     base["down_wn_sq"][e], base["down_pair_dot"][e])
+         for j, e in enumerate(experts)],
+    )
+    thr = [pick_threshold(e) for e in energies]
+    tables = sparsity_tables_from_weights(gate_cold, up_cold, down_cold, *thr)
+    rows = (GATEUP_K_ROWS, GATEUP_K_ROWS, DOWN_K_ROWS)
+    expect = torch.tensor(
+        [[sum(int((e >= thr[p] * thr[p]).sum()) for e in energies[p]),
+          num_experts_per_tok * rows[p] // 2] for p in range(3)],
+        dtype=torch.int64)
+    return (gate_cold, up_cold, down_cold), tables, ids, x, act, expect
+
+
+@pytest.mark.cpu
+def test_sparse_keep_counter_matches_decode_masks():
+    """keep_ctr[proj] accumulates the kept and total pairs of every decode mask."""
+    weights, tables, ids, x, act, expect = _keep_counter_case(24)
+    cpuinfer = kt_kernel_ext.CPUInfer(CPUINFER_PARAM)
+    ctr = torch.zeros(3, 2, dtype=torch.int64)
+    sparse = build_sparse_moe(*weights, cpuinfer, tables, keep_ctr=ctr)
+    assert 0 < int(expect[:, 0].sum()) < int(expect[:, 1].sum()), "mask is trivial"
+
+    w = router_weights(1)
+    run_gateup(sparse, ids, x, w)
+    run_down(sparse, ids, act, w)
+    assert torch.equal(ctr, expect)
+
+    run_gateup(sparse, ids, x, w)
+    run_down(sparse, ids, act, w)
+    assert torch.equal(ctr, 2 * expect), "counters must be cumulative"
+
+
+@pytest.mark.cpu
+def test_sparse_keep_counter_ignores_dense_calls():
+    """Calls without router weights (dense decode, and prefill, which kt keeps dense) do not count."""
+    weights, tables, ids, x, act, _ = _keep_counter_case(25)
+    cpuinfer = kt_kernel_ext.CPUInfer(CPUINFER_PARAM)
+    ctr = torch.zeros(3, 2, dtype=torch.int64)
+    sparse = build_sparse_moe(*weights, cpuinfer, tables, keep_ctr=ctr)
+
+    run_gateup(sparse, ids, x)
+    run_down(sparse, ids, act)
+    qlen = 16
+    ids_p = make_routing(qlen)
+    run_gateup(sparse, ids_p, randn_gen((qlen, hidden_size)).contiguous())
+    run_down(sparse, ids_p, randn_gen((qlen, num_experts_per_tok, intermediate_size)).contiguous())
+    assert torch.equal(ctr, torch.zeros(3, 2, dtype=torch.int64))
 
 
 @pytest.mark.cpu
